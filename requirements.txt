@@ -1,0 +1,11 @@
+# jspect Python dependencies
+#
+# The tool itself uses only the Python stdlib — these two are for downstream
+# Stage 6 (Semgrep SAST) and Stage 2c (JS beautification).
+#
+#   pip install -r requirements.txt
+#
+# External (non-pip) tools are installed separately — see README.md "Dependencies".
+
+semgrep>=1.0
+jsbeautifier>=1.15

@@ -1,0 +1,69 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.python-version
+
+# ── Editor / OS noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# ── Tool run outputs (auto-timestamped jspect-* directories) ────────────────
+jspect-*/
+report-*/
+output/
+out/
+runs/
+
+# ── Per-stage artifacts that may end up loose during development ─────────────
+katana-out.txt
+js-urls.txt
+endpoints.json
+live-endpoints.json
+live-endpoints-meta.json
+http-calls.json
+secrets.json
+secrets-extended.json
+semgrep.json
+.semgrep-local.yaml
+retire.json
+trufflehog.json
+comments.json
+url-map.json
+exposed-maps.json
+wayback-maps.json
+recon-summary.json
+recon-secrets.json
+dorks.json
+swagger-endpoints.json
+dangling-js.json
+well-known.json
+well-known-urls.txt
+well-known-trust.json
+js-clean/
+sources/
+recon/
+well-known/
+
+# ── Optional cloned helper (not strictly required; see README) ───────────────
+# Tool detects mapperplus at ./mapperplus/mapperplus.py if present, otherwise
+# falls back to unwebpack-sourcemap or its built-in Python extractor.
+mapperplus/
+
+# ── Local Docker volumes / dev iteration scratch ─────────────────────────────
+*.local
+*.bak
+*.tmp
