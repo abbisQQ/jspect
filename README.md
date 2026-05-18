@@ -170,6 +170,41 @@ python3 jspect.py -u http://localhost:4000 -H "Cookie: $COOKIE"
 
 ---
 
+## Proxy
+
+`--proxy URL` routes **every outbound request** the tool makes through the given proxy — Katana's crawl, JS downloads, live-endpoint validation, well-known probes, Wayback CDX queries, active-recon Google CSE calls, blind source-map probes. Useful for Burp Suite, mitmproxy, ZAP, or Tor.
+
+```bash
+# Burp Suite (default proxy port)
+python3 jspect.py -u https://target.com \
+    --proxy http://127.0.0.1:8080 \
+    --proxy-insecure                       # Burp uses a self-signed CA
+
+# mitmproxy
+python3 jspect.py -u https://target.com --proxy http://127.0.0.1:8080 --proxy-insecure
+
+# Tor SOCKS
+python3 jspect.py -u https://target.com --proxy socks5://127.0.0.1:9050
+
+# Inside Docker — point at the host's proxy
+docker run --rm -v $(pwd)/out:/output jspect:latest \
+    -u https://target.com \
+    --proxy http://host.docker.internal:8080 \
+    --proxy-insecure
+```
+
+### How it's wired
+
+| Component | Routing |
+|---|---|
+| Python `fetch_url()` (live-validate, well-known, Wayback CDX, blind-probe, recon) | Via `HTTP_PROXY`/`HTTPS_PROXY` env vars (urllib auto-detects) |
+| Katana (Stage 1 crawl) | Via `-proxy <url>` flag passed directly to Katana |
+| Subprocess tools (Semgrep, Retire.js, TruffleHog, JSluice) | They operate on local files only — no outbound traffic; proxy doesn't apply |
+
+`--proxy-insecure` also disables Python TLS verification when talking to the proxy (sets `PYTHONHTTPSVERIFY=0`, clears CA bundles). The target-side TLS context was already permissive (accepts self-signed leaf certs) — that's unrelated.
+
+---
+
 ## Pipeline Stages
 
 | Stage | Name | Description |
@@ -216,6 +251,8 @@ python3 jspect.py --help
 | `--no-beautify` | off | Skip JS beautification (faster, less readable output) |
 | `--headless` | off | Run Katana in headless Chrome mode (**experimental upstream — hangs silently on macOS**; recommended only on Linux/Docker). |
 | `--verify-secrets` | off | Run TruffleHog with `--only-verified` (makes real API calls — check ROE) |
+| `--proxy URL` | — | Route every outbound HTTP/HTTPS request through this proxy — Katana, JS download, live validation, well-known probe, Wayback CDX, active-recon, blind-probe. Example: `http://127.0.0.1:8080` (Burp), `socks5://127.0.0.1:9050` (Tor). See [Proxy](#proxy) below. |
+| `--proxy-insecure` | off | Skip TLS verification on the proxy connection (needed for Burp/mitmproxy with self-signed certs). |
 | `-v` / `-vv` | normal | Verbose / debug logging |
 | `-q` | off | Quiet mode — suppress non-essential output |
 

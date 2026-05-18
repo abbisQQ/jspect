@@ -487,7 +487,8 @@ def run(cmd, cwd=None, check=True, capture=False, quiet=False, timeout=None):
 
 # ---------- Stage 1: Katana ----------
 
-def run_katana(target, output_dir, headers, depth, rate_limit, headless, max_duration):
+def run_katana(target, output_dir, headers, depth, rate_limit, headless, max_duration,
+               proxy=None):
     stage_header(1, "Katana crawl")
     out_txt = output_dir / "katana-out.txt"
     # Persist the seed URL so downstream stages can fall back to the homepage
@@ -539,6 +540,11 @@ def run_katana(target, output_dir, headers, depth, rate_limit, headless, max_dur
         cmd.extend(["-H", h])
     if headers:
         Log.verbose(f"using {len(headers)} auth header(s)")
+
+    # Katana ignores HTTP(S)_PROXY env vars — it only honors its own -proxy flag.
+    if proxy:
+        cmd.extend(["-proxy", proxy])
+        Log.verbose(f"routing Katana through proxy: {proxy}")
 
     Log.verbose(f"depth={depth}, rate-limit={rate_limit}/s, max-duration={max_duration}min")
 
@@ -5383,6 +5389,13 @@ def main():
                         help=argparse.SUPPRESS)   # deprecated, kept for back-compat
     parser.add_argument("--verify-secrets", action="store_true",
                         help="Run TruffleHog with --only-verified (makes real API calls — check ROE)")
+    parser.add_argument("--proxy", default=None, metavar="URL",
+                        help="HTTP/SOCKS proxy for every outbound request "
+                             "(e.g. http://127.0.0.1:8080 for Burp, socks5://127.0.0.1:9050 for Tor). "
+                             "Sets HTTP(S)_PROXY env vars and passes -proxy to Katana.")
+    parser.add_argument("--proxy-insecure", action="store_true",
+                        help="Skip TLS verification on the proxy connection "
+                             "(needed for Burp/mitmproxy with self-signed certs)")
     parser.add_argument("--threads", type=int, default=None, metavar="N",
                         help=f"Concurrent workers for JS download + endpoint probing "
                              f"(default {THREAD_POOL_WORKERS}). Use 1 to be polite to small targets.")
@@ -5423,6 +5436,25 @@ def main():
             parser.error("--max-endpoints must be >= 0 (0 = unlimited)")
         # 0 → effectively infinite (large enough to never hit)
         MAX_ENDPOINTS_TO_VALIDATE = args.max_endpoints if args.max_endpoints > 0 else 10**9
+
+    # Optional proxy: set env vars so urllib (Python stages) and child processes
+    # (Semgrep, Retire.js, TruffleHog, etc.) all route through it. Katana is
+    # handled separately via its own -proxy arg in run_katana().
+    if args.proxy:
+        p = args.proxy.strip()
+        os.environ["HTTP_PROXY"]  = p
+        os.environ["HTTPS_PROXY"] = p
+        os.environ["http_proxy"]  = p
+        os.environ["https_proxy"] = p
+        Log.info(f"    {C.DIM}↳ proxy: all HTTP requests routed through {p}{C.RESET}")
+        if args.proxy_insecure:
+            # urllib + our permissive_ssl_context() already disable cert verification
+            # on the target side; this env var also tells child tools that mostly
+            # respect it (requests, httpx, etc.) to skip proxy TLS validation.
+            os.environ["PYTHONHTTPSVERIFY"] = "0"
+            os.environ["CURL_CA_BUNDLE"]    = ""
+            os.environ["REQUESTS_CA_BUNDLE"] = ""
+
     if args.dir and not Path(args.dir).is_dir():
         parser.error(f"--dir path does not exist or is not a directory: {args.dir}")
 
@@ -5511,6 +5543,7 @@ def main():
         katana_out, url_count = run_katana(
             args.url, output_dir, args.header, args.depth, args.rate_limit,
             headless=headless_requested, max_duration=args.max_duration,
+            proxy=args.proxy,
         )
         if not katana_out:
             # Don't bail — well-known, active-recon, and Wayback don't need crawl
