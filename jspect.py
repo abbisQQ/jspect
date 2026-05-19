@@ -4195,6 +4195,45 @@ code, .mono {
     word-break: break-all;
     color: var(--text);
 }
+/* ── critical findings (TL;DR) ── */
+ul.critical {
+    list-style: none;
+    padding: 0;
+    margin: 4px 0 6px;
+}
+ul.critical li {
+    padding: 8px 10px;
+    border-left: 3px solid var(--border);
+    margin: 6px 0;
+    background: var(--surface-2);
+    border-radius: 3px;
+    font-size: 14px;
+}
+ul.critical li a { color: var(--text); text-decoration: none; }
+ul.critical li a:hover { text-decoration: underline; }
+
+/* ── hidden / zero-value stats toggle ── */
+details.hidden-stats {
+    margin-top: 8px;
+    font-size: 12px;
+}
+details.hidden-stats summary {
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 6px 0;
+    list-style: none;
+    user-select: none;
+}
+details.hidden-stats summary::before {
+    content: "▸ ";
+}
+details.hidden-stats[open] summary::before {
+    content: "▾ ";
+}
+details.hidden-stats[open] summary {
+    margin-bottom: 6px;
+}
+
 /* ── summary stat grid ── */
 .summary-grid {
     display: grid;
@@ -4334,6 +4373,21 @@ def html_escape(s):
     return html.escape(str(s)) if s is not None else ""
 
 
+def _has_critical_findings(results: dict) -> bool:
+    """True if at least one finding should appear in the Critical Findings TL;DR."""
+    return any((
+        results.get("retire_vulns", 0) > 0,
+        results.get("exposed_maps_count", 0) > 0,
+        results.get("wayback_only_count", 0) > 0,
+        results.get("well_known_leaks", 0) > 0,
+        results.get("semgrep_error", 0) > 0,
+        results.get("recon_secrets_found", 0) > 0,
+        results.get("well_known_trust_count", 0) > 0,
+        results.get("dangling_count", 0) > 0,
+        results.get("th_verified") and results.get("th_candidates", 0) > 0,
+    ))
+
+
 def generate_report(target, output_dir, results):
     stage_header(9, "Generating HTML report")
     report_path = output_dir / "report.html"
@@ -4418,17 +4472,40 @@ def generate_report(target, output_dir, results):
     parts.append("<nav>")
     parts.append("<span class='nav-brand'>🔍 jspect</span>")
     parts.append("<div class='nav-links'>")
-    for href, label, cls in [
-        ("#summary",     "Summary",       ""),
-        ("#endpoints",   "Endpoints",     "has-findings" if results.get("endpoint_count",0) else ""),
-        ("#live",        "Live",          "has-findings" if results.get("live_count",0) else ""),
-        ("#http-calls",  "HTTP Calls",    "has-findings" if results.get("http_calls_count",0) else ""),
-        ("#semgrep",     "Semgrep",       semgrep_cls),
-        ("#secrets",     "Secrets",       secrets_cls),
-        ("#retire",      "Libraries",     retire_cls),
-        ("#comments",    "Comments",      ""),
-        ("#next-steps",  "Next Steps",    ""),
-    ]:
+    # Minimalism: skip nav links to sections that won't render any content.
+    # Each tuple is (href, label, css class, should-show predicate).
+    nav_items = [
+        ("#critical",    "Critical",      "has-error", _has_critical_findings(results)),
+        ("#summary",     "Summary",       "", True),
+        ("#endpoints",   "Endpoints",     "has-findings" if results.get("endpoint_count",0) else "",
+            bool(results.get("endpoint_count", 0))),
+        ("#live",        "Live",          "has-findings" if results.get("live_count",0) else "",
+            bool(results.get("live_count", 0))),
+        ("#http-calls",  "HTTP Calls",    "has-findings" if results.get("http_calls_count",0) else "",
+            bool(results.get("http_calls_count", 0))),
+        ("#semgrep",     "Semgrep",       semgrep_cls,
+            bool(results.get("semgrep_total", 0))),
+        ("#secrets",     "Secrets",       secrets_cls,
+            bool(results.get("jsluice_secrets", 0) or results.get("secrets_ext_count", 0)
+                 or results.get("th_candidates", 0))),
+        ("#retire",      "Libraries",     retire_cls,
+            bool(results.get("retire_vulns", 0))),
+        ("#maps",        "Maps",          "has-findings" if results.get("exposed_maps_count",0) else "",
+            bool(results.get("exposed_maps_count", 0))),
+        ("#well-known",  "Well-known",    "has-error" if results.get("well_known_leaks",0)
+            else ("has-findings" if results.get("well_known_hits", 0) else ""),
+            bool(results.get("well_known_hits", 0))),
+        ("#comments",    "Comments",      "",
+            bool(results.get("comments_count", 0))),
+        ("#next-steps",  "Next Steps",    "",
+            _has_critical_findings(results)
+            or bool(results.get("endpoint_count", 0))
+            or bool(results.get("comments_count", 0))
+            or bool(results.get("well_known_harvested", 0))),
+    ]
+    for href, label, cls, show in nav_items:
+        if not show:
+            continue
         parts.append(f"<a href='{href}' class='{cls}'>{html_escape(label)}</a>")
     parts.append("</div></nav>")
 
@@ -4442,6 +4519,54 @@ def generate_report(target, output_dir, results):
     parts.append(f"<dt>Output</dt><dd><code>{html_escape(str(output_dir))}</code></dd>")
     parts.append("</dl>")
     parts.append("</header>")
+
+    # ── Critical Findings (TL;DR) ────────────────────────────────────
+    # Surfaces only the actionable, high-priority items at the very top so
+    # the operator can decide what to look at first without scrolling.
+    critical = []
+    if results.get("retire_vulns", 0) > 0:
+        n = results.get("retire_vulns", 0)
+        libs = results.get("retire_vuln_libs", 0)
+        critical.append(("error", "#retire",
+                         f"{n} known CVE(s) in {libs} vulnerable librar{'y' if libs == 1 else 'ies'}"))
+    if results.get("exposed_maps_count", 0) > 0:
+        critical.append(("error", "#maps",
+                         f"{results['exposed_maps_count']} exposed source map(s) — production misconfig"))
+    if results.get("wayback_only_count", 0) > 0:
+        critical.append(("error", "#wayback-maps",
+                         f"{results['wayback_only_count']} historical map(s) archived only — previously leaked"))
+    if results.get("well_known_leaks", 0) > 0:
+        critical.append(("error", "#well-known",
+                         f"{results['well_known_leaks']} leak(s) at well-known paths"))
+    if results.get("semgrep_error", 0) > 0:
+        critical.append(("error", "#semgrep",
+                         f"{results['semgrep_error']} Semgrep ERROR finding(s) — likely dangerous sinks"))
+    if results.get("recon_secrets_found", 0) > 0:
+        critical.append(("error", "#active-recon",
+                         f"{results['recon_secrets_found']} secret(s) in active-recon downloads"))
+    if results.get("well_known_trust_count", 0) > 0:
+        critical.append(("warning", "#well-known",
+                         f"{results['well_known_trust_count']} cross-origin trusted domain(s) "
+                         "(crossdomain/clientaccesspolicy)"))
+    if results.get("dangling_count", 0) > 0:
+        critical.append(("warning", "#dangling",
+                         f"{results['dangling_count']} dangling JS reference(s) — potential takeover"))
+    if results.get("th_verified") and results.get("th_candidates", 0) > 0:
+        critical.append(("error", "#secrets",
+                         f"{results['th_candidates']} TruffleHog-verified secret(s)"))
+
+    if critical:
+        parts.append(section("critical", "Critical Findings",
+                             str(len(critical)),
+                             "error" if any(s == "error" for s, _, _ in critical) else "warning",
+                             open_=True))
+        parts.append("<ul class='critical'>")
+        for sev, anchor, msg in critical:
+            badge = ("<span class='badge error'>!</span>" if sev == "error"
+                     else "<span class='badge warning'>•</span>")
+            parts.append(f"<li>{badge} <a href='{anchor}'>{html_escape(msg)}</a></li>")
+        parts.append("</ul>")
+        parts.append(end_section())
 
     # ── Summary ──────────────────────────────────────────────────────
     parts.append(section("summary", "Summary", open_=True))
@@ -4491,10 +4616,33 @@ def generate_report(target, output_dir, results):
         ("Source maps",           "yes" if results.get("source_maps") else "no",
          "success" if results.get("source_maps") else ""),
     ]
-    for label, value, cls in stats:
+    # Minimalism: render only stats whose value is truthy/non-zero. Stash the
+    # rest behind a collapsible "show all" toggle so debugging info is still
+    # one click away without polluting the at-a-glance summary on light targets.
+    def _is_zeroish(v):
+        # "0", 0, "", None, and the literal "no" (used by source_maps) are all hidden by default
+        return v in (0, "0", "", None, "no")
+    shown_stats = [s for s in stats if not _is_zeroish(s[1])]
+    hidden_stats = [s for s in stats if _is_zeroish(s[1])]
+    if not shown_stats:
+        # Pure-empty target — at least show JS / endpoints / URLs as zeros so
+        # the report doesn't look like the scan didn't run.
+        shown_stats = [s for s in stats if s[0] in ("URLs crawled", "JS files", "Endpoints found")]
+        hidden_stats = [s for s in stats if s not in shown_stats]
+    for label, value, cls in shown_stats:
         parts.append(f"<div class='stat'><div class='stat-label'>{html_escape(label)}</div>"
                      f"<div class='stat-value {cls}'>{html_escape(value)}</div></div>")
     parts.append("</div>")
+    if hidden_stats:
+        parts.append(
+            f"<details class='hidden-stats'><summary>"
+            f"+ {len(hidden_stats)} more (zero / no findings)"
+            f"</summary><div class='summary-grid'>"
+        )
+        for label, value, cls in hidden_stats:
+            parts.append(f"<div class='stat'><div class='stat-label'>{html_escape(label)}</div>"
+                         f"<div class='stat-value {cls}'>{html_escape(value)}</div></div>")
+        parts.append("</div></details>")
     parts.append(end_section())
 
     # ── Endpoints ────────────────────────────────────────────────────
@@ -5261,16 +5409,50 @@ def generate_report(target, output_dir, results):
         parts.append(end_section())
 
     # ── Next steps ───────────────────────────────────────────────────
-    parts.append(section("next-steps", "Next Steps", open_=True))
-    parts.append("<div class='next-steps'><ol>")
-    parts.append("<li>Triage <strong>auth-protected (401/403)</strong> live endpoints — obtain a valid JWT via /rest/user/login first</li>")
-    parts.append("<li>Manually verify <strong>Semgrep innerHTML/outerHTML</strong> sinks — confirm user-controlled input reaches them</li>")
-    parts.append("<li>Test all <strong>open redirect</strong> candidates with an external URL — chain with XSS for phishing</li>")
-    parts.append("<li>Review <strong>HTTP Calls</strong> section for URLs not covered by the endpoint list (potential hidden API surface)</li>")
-    parts.append("<li>Inspect <strong>extended secret matches</strong> in raw JS before any live validation (check ROE)</li>")
-    parts.append("<li>Fuzz endpoints with body/query params using Burp Intruder or ffuf</li>")
-    parts.append("</ol></div>")
-    parts.append(end_section())
+    # Only suggest actions for things that were actually found in this run.
+    # Avoids the "Triage 401/403 endpoints" suggestion on reports with zero
+    # 401/403 endpoints.
+    steps = []
+    auth_protected = sum(1 for e in live_eps if e.get("status") in (401, 403))
+    if auth_protected:
+        steps.append("Triage <strong>auth-protected (401/403)</strong> live endpoints — "
+                     "obtain a valid session/JWT before re-running with <code>-H Cookie/Authorization</code>")
+    if results.get("retire_vulns", 0):
+        steps.append("Review the <strong>Libraries</strong> section — verify CVE applicability "
+                     "against the actual deployment (not every CVE affects every config)")
+    if results.get("exposed_maps_count", 0):
+        steps.append("Mine the extracted <strong>sources/</strong> directory for hardcoded "
+                     "secrets, internal URLs, and API surface revealed by source maps")
+    if results.get("semgrep_error", 0):
+        steps.append("Manually verify <strong>Semgrep ERROR</strong> sinks — confirm "
+                     "user-controlled input reaches them (regex matches alone don't prove exploitability)")
+    if results.get("open_redirect_count", 0) or any(
+            is_open_redirect_candidate(e) for e in (endpoints or [])):
+        steps.append("Test <strong>open redirect</strong> candidates with an external URL — "
+                     "chain with XSS for phishing payloads")
+    if results.get("http_calls_count", 0):
+        steps.append("Cross-reference <strong>HTTP Calls</strong> against the endpoint list — "
+                     "some URLs are only reachable through the JS flow")
+    if results.get("secrets_ext_count", 0) or results.get("jsluice_secrets", 0):
+        steps.append("Inspect <strong>extended secret matches</strong> in raw JS before any "
+                     "live validation (check ROE — most are false positives, the rest are real)")
+    if results.get("well_known_leaks", 0):
+        steps.append("Confirm <strong>well-known leaks</strong> are real config files (not SPA "
+                     "catch-all responses) — pull each one directly with curl to verify")
+    if results.get("dangling_count", 0):
+        steps.append("Check <strong>dangling JS</strong> references for subdomain-takeover "
+                     "candidates (CNAMEd to expired CDN/storage bucket?)")
+    if results.get("well_known_harvested", 0) > 50:
+        steps.append(f"Fuzz the <strong>{results['well_known_harvested']} harvested URLs</strong> "
+                     "with Burp Intruder or ffuf for parameter-based auth/IDOR")
+
+    if steps:
+        parts.append(section("next-steps", "Next Steps", open_=True))
+        parts.append("<div class='next-steps'><ol>")
+        for s in steps:
+            parts.append(f"<li>{s}</li>")
+        parts.append("</ol></div>")
+        parts.append(end_section())
 
     # ── Footer ───────────────────────────────────────────────────────
     parts.append(f"<footer>Generated by jspect · {html_escape(now)}</footer>")
