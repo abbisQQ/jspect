@@ -333,17 +333,13 @@ def is_in_scope(url, target_host):
     # Absolute URL with scheme — check hostname
     if url.startswith(("http://", "https://")):
         try:
-            parsed = urlparse(url).hostname
-            if not parsed or not target_host:
-                return False
-            return parsed == target_host or parsed.endswith("." + target_host)
+            return _host_matches(urlparse(url).hostname or "", target_host)
         except Exception:
             return False
     # Protocol-relative URL (//other.com/foo) — check hostname
     if url.startswith("//"):
         try:
-            parsed = urlparse("https:" + url).hostname
-            return bool(parsed) and (parsed == target_host or parsed.endswith("." + target_host))
+            return _host_matches(urlparse("https:" + url).hostname or "", target_host)
         except Exception:
             return False
     # Skip obvious non-URL strings (mime types, scheme-only fragments, etc.)
@@ -421,6 +417,14 @@ def count_nonempty_lines(path):
         return 0
 
 
+def _host_matches(h: str, target_host: str) -> bool:
+    """True if hostname `h` is `target_host` or a subdomain of it.
+    Lower-level helper for callers that already have a parsed hostname.
+    Use `host_in_scope(url, target_host)` instead when given a raw URL.
+    """
+    return bool(h) and bool(target_host) and (h == target_host or h.endswith("." + target_host))
+
+
 def host_in_scope(url, target_host):
     """True if URL's host matches target_host or is a subdomain of it."""
     if not url or not target_host:
@@ -434,9 +438,7 @@ def host_in_scope(url, target_host):
             return False
     except Exception:
         return False
-    if not h:
-        return False
-    return h == target_host or h.endswith("." + target_host)
+    return _host_matches(h or "", target_host)
 
 
 def is_open_redirect_candidate(endpoint):
@@ -618,7 +620,7 @@ def _scripts_from_html_pages(page_urls: list[str], headers) -> list[str]:
                     url = urljoin(page_url, ref)
                 # Same-host filter
                 u_host = urlparse(url).hostname or ""
-                if u_host != base_host and not u_host.endswith("." + base_host):
+                if not _host_matches(u_host, base_host):
                     continue
                 # Strip the fragment, keep the query (some CMSes use bundlers with ?v=)
                 url = url.split("#", 1)[0]
@@ -826,7 +828,7 @@ def discover_nested_js(js_clean, output_dir, headers, target, max_levels=2):
     dangling = []   # JS URLs that returned 4xx — potential dangling-resource issues
     new_added = 0
 
-    def normalize(ref, source_file=None):
+    def normalize(ref):
         """Turn a JS reference into an absolute URL. Returns None for unsupported."""
         ref = ref.strip()
         if not ref:
@@ -845,12 +847,9 @@ def discover_nested_js(js_clean, output_dir, headers, target, max_levels=2):
 
     def is_target_host(url):
         try:
-            h = urlparse(url).hostname or ""
+            return _host_matches(urlparse(url).hostname or "", target_host)
         except Exception:
             return False
-        if not h:
-            return False
-        return h == target_host or h.endswith("." + target_host)
 
     def fetch(url):
         try:
@@ -875,7 +874,7 @@ def discover_nested_js(js_clean, output_dir, headers, target, max_levels=2):
                 continue
             for m in JS_URL_RE.finditer(content):
                 ref = m.group(1)
-                norm = normalize(ref, source_file=jsfile.name)
+                norm = normalize(ref)
                 if not norm or norm in seen_urls:
                     continue
                 if not is_target_host(norm):
@@ -1195,7 +1194,7 @@ def run_jsluice(target_dir, output_dir):
                         capture_output=True, text=True, timeout=JSLUICE_TIMEOUT,
                     )
                 except subprocess.TimeoutExpired:
-                    Log.warn(f"jsluice {subcommand} timed out on batch {i // BATCH + 1}")
+                    Log.warn(f"jsluice {subcommand} timed out on batch {i // JSLUICE_BATCH_SIZE + 1}")
                     continue
                 if result.stdout:
                     out.write(result.stdout)
@@ -1529,7 +1528,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
                 map_host = urlparse(map_url).hostname or ""
             except Exception:
                 continue
-            if not (map_host == target_host or map_host.endswith("." + target_host)):
+            if not _host_matches(map_host, target_host):
                 continue  # out of scope
 
             status, body = fetch(map_url)
@@ -1568,7 +1567,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
                 map_host = urlparse(map_url).hostname or ""
             except Exception:
                 continue
-            if not (map_host == target_host or map_host.endswith("." + target_host)):
+            if not _host_matches(map_host, target_host):
                 continue
             status, body = fetch(map_url)
             if status == 200 and body.strip().startswith(("{", "[")):
@@ -1640,7 +1639,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
                 json_host = urlparse(url).hostname or ""
             except Exception:
                 continue
-            if json_host == target_host or json_host.endswith("." + target_host):
+            if _host_matches(json_host, target_host):
                 json_refs.add(url)
 
     # Also probe well-known JSON paths even if not referenced
@@ -1857,9 +1856,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
     cdx_url = _CDX_API + "?" + _urlparse.urlencode(cdx_params)
     Log.verbose(f"CDX query: {cdx_url}")
 
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = permissive_ssl_context()
 
     try:
         req = urllib.request.Request(cdx_url, headers={"User-Agent": "Mozilla/5.0 jspect/1.0"})
@@ -1867,7 +1864,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
             raw = resp.read().decode("utf-8", errors="replace")
         cdx_rows: list[list[str]] = json.loads(raw)
     except Exception as exc:
-        Log.warn(f"    [!] CDX API error: {exc}")
+        Log.warn(f"CDX API error: {exc}")
         return {"wayback_maps_file": None, "wayback_maps_count": 0, "wayback_only_count": 0}
 
     # CDX returns a header row then data rows [[original,timestamp,statuscode], ...]
@@ -1881,7 +1878,7 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
         idx_url = header_row.index("original")
         idx_ts  = header_row.index("timestamp")
     except ValueError:
-        Log.warn("    [!] Unexpected CDX response format")
+        Log.warn("Unexpected CDX response format")
         return {"wayback_maps_file": None, "wayback_maps_count": 0, "wayback_only_count": 0}
 
     Log.info(f"    [+] CDX returned {len(data_rows)} unique historical map URL(s)")
@@ -2807,7 +2804,7 @@ _SECRET_PATTERNS = [
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{36,}\b"),
      "github-token"),
     # Slack webhook
-    (re.compile(r"https://hooks\.slack\.com/services/[A-Z0-9]{9}/[A-Z0-9B-Z0-9]{11}/[A-Za-z0-9]{24}"),
+    (re.compile(r"https://hooks\.slack\.com/services/[A-Z0-9]{9}/[A-Z0-9]{11}/[A-Za-z0-9]{24}"),
      "slack-webhook"),
     # SendGrid
     (re.compile(r"\bSG\.[A-Za-z0-9\-_]{22,}\.[A-Za-z0-9\-_]{43,}\b"),
