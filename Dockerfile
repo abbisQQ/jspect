@@ -48,7 +48,14 @@ COPY --from=go-builder /go/bin/jsluice      /usr/local/bin/
 COPY --from=go-builder /go/bin/sourcemapper /usr/local/bin/
 
 # ── Python tools ──────────────────────────────────────────────────────────────
-RUN pip install --no-cache-dir semgrep jsbeautifier
+RUN pip install --no-cache-dir semgrep jsbeautifier playwright
+
+# ── Playwright Chromium (used by Stage 1b --ajax-spider) ─────────────────────
+# Playwright bundles its own Chromium build. We install it here so the image is
+# self-contained; users who don't pass --ajax-spider just won't invoke it. The
+# system /usr/bin/chromium installed earlier is for Katana's headless mode (a
+# different code path) and is kept separately.
+RUN playwright install --with-deps chromium
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Point go-rod (Katana's browser engine) to the system Chromium.

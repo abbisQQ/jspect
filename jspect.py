@@ -35,18 +35,24 @@ Usage:
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import math
 import os
 import platform
 import re
 import shutil
+import ssl
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
-import urllib.parse
 
 
 def _in_docker() -> bool:
@@ -361,6 +367,135 @@ def looks_like_api(url):
 
 # ---------- Shared HTTP / I/O helpers ----------
 
+# Headers we strip when ingesting a Burp / curl-style raw HTTP request because
+# they're either transport-layer noise or things we synthesize ourselves
+# (User-Agent). Cookie / Authorization / X-*-Token / Origin are KEPT.
+_BURP_NOISE_HEADERS = {
+    "host",                # used to build the URL; not passed as -H
+    "content-length",      # request-body specific, not auth
+    "connection",
+    "upgrade-insecure-requests",
+    "accept", "accept-encoding", "accept-language",
+    "user-agent",          # we set our own — overwriting causes WAF mismatches
+    "cache-control", "pragma",
+    "te", "trailer",
+    "if-modified-since", "if-none-match",
+    # Sec-Fetch and Sec-Ch-UA family — browser hints, useless for scanning
+    "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-user",
+    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+}
+
+
+def _parse_raw_http_request(text: str) -> dict:
+    """Parse a raw HTTP request (as copied from Burp, curl -v, mitmproxy export,
+    etc.) into something the rest of the tool can consume.
+
+    Handles both HTTP/1.1 request lines (`GET /path HTTP/1.1`) and HTTP/2
+    pseudo-headers (`:method`, `:path`, `:authority`, `:scheme`). Strips
+    transport-layer noise; keeps Cookie / Authorization / custom auth headers.
+
+    Returns: {
+        'url':     'https://target.com/api/users?x=1',
+        'method':  'GET',
+        'headers': ['Cookie: session=abc', 'Authorization: Bearer ...'],
+        'body':    '...' or '',
+    }
+    Raises ValueError if the input doesn't look like an HTTP request at all.
+    """
+    if not text or not text.strip():
+        raise ValueError("empty request")
+
+    # Normalize line endings, split header block from body
+    text = text.replace("\r\n", "\n").lstrip()
+    if "\n\n" in text:
+        header_block, body = text.split("\n\n", 1)
+    else:
+        header_block, body = text, ""
+
+    lines = header_block.split("\n")
+    if not lines:
+        raise ValueError("no lines in request")
+
+    method = "GET"
+    path   = "/"
+    host   = None
+    scheme = None
+    headers: list[str] = []
+
+    # ── First line: classic request line `GET /path HTTP/1.1` ────────────────
+    first = lines[0].strip()
+    pseudo_only = False
+    if first.startswith(":"):
+        # HTTP/2 pseudo-header style — no traditional request line
+        pseudo_only = True
+        header_lines = lines
+    else:
+        parts = first.split(None, 2)
+        if len(parts) >= 2 and parts[1].startswith("/"):
+            method = parts[0].upper()
+            path   = parts[1]
+            header_lines = lines[1:]
+        else:
+            # Doesn't look like a request line — assume the first line is a
+            # header too (some exports start with the request line stripped)
+            pseudo_only = True
+            header_lines = lines
+
+    # ── Header lines ─────────────────────────────────────────────────────────
+    for line in header_lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # HTTP/2 pseudo-headers like `:method: POST` — first colon is part of
+        # the field name, so we need to split on the SECOND one.
+        if line.startswith(":"):
+            rest = line[1:]
+            if ":" not in rest:
+                continue
+            name_no_colon, value = rest.split(":", 1)
+            lname = ":" + name_no_colon.strip().lower()
+            value = value.strip()
+            if lname == ":method":      method = value.upper()
+            elif lname == ":path":      path   = value
+            elif lname == ":authority": host   = value
+            elif lname == ":scheme":    scheme = value
+            continue
+
+        if ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        name = name.strip()
+        value = value.strip()
+        lname = name.lower()
+
+        if lname == "host":
+            host = value
+            continue
+
+        # Heuristically detect HTTP scheme from Origin/Referer if user didn't
+        # paste an HTTP/2 :scheme pseudo-header.
+        if scheme is None and lname in ("origin", "referer"):
+            if value.startswith("http://"):  scheme = "http"
+            elif value.startswith("https://"): scheme = "https"
+
+        if lname in _BURP_NOISE_HEADERS:
+            continue
+
+        headers.append(f"{name}: {value}")
+
+    if not host:
+        raise ValueError("no Host / :authority header found — can't build URL")
+
+    if scheme is None:
+        # Default to https — Burp's clipboard export from HTTPS sessions is
+        # the vast majority of paste sources.
+        scheme = "https"
+
+    url = f"{scheme}://{host}{path}"
+    return {"url": url, "method": method, "headers": headers, "body": body}
+
+
 def parse_headers(headers):
     """Parse a list of 'Name: value' header strings into a dict.
     Always returns a dict with at least a User-Agent header set.
@@ -376,7 +511,6 @@ def parse_headers(headers):
 
 def permissive_ssl_context():
     """SSL context that accepts self-signed certs common on UAT/dev targets."""
-    import ssl
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -392,8 +526,6 @@ def fetch_url(url, headers=None, timeout=15, max_bytes=None):
 
     Errors are caught and logged at debug level — never raised.
     """
-    import urllib.request
-    import urllib.error
     try:
         req = urllib.request.Request(url, headers=headers or {})
         with urllib.request.urlopen(req, context=permissive_ssl_context(), timeout=timeout) as resp:
@@ -643,12 +775,645 @@ def _scripts_from_html_pages(page_urls: list[str], headers) -> list[str]:
     return out
 
 
+# ---------- Stage 1b: AJAX spider (Playwright) ----------
+
+# Per-page interaction caps — kept small so a single bad page can't blow out the
+# whole crawl. Total per-target wallclock is bounded by AJAX_SPIDER_TIMEOUT.
+AJAX_SPIDER_NAV_TIMEOUT      = 20    # seconds — initial page load
+AJAX_SPIDER_NETWORK_IDLE     = 5     # seconds — wait for SPA hydration after each action
+AJAX_SPIDER_POST_CLICK_IDLE  = 2     # seconds — wait after each click for any triggered XHR
+AJAX_SPIDER_TIMEOUT          = 180   # seconds — total cap across all pages
+AJAX_SPIDER_PAGES_DEFAULT    = 8     # how many Katana-discovered pages to also visit
+AJAX_SPIDER_CLICKS_DEFAULT   = 25    # max interactive elements clicked per page (initial pass)
+AJAX_SPIDER_DEPTH            = 2     # interaction depth — re-query after each pass to find revealed elements
+AJAX_SPIDER_CLICK_TIMEOUT    = 2     # seconds — per-click timeout (Playwright default is 30s, way too long)
+
+# Asset extensions we skip when picking which Katana pages to visit (we want
+# pages that render, not blobs that don't have interactive content).
+_NON_PAGE_EXTENSIONS = (
+    ".js", ".mjs", ".js.map", ".css", ".png", ".jpg", ".jpeg", ".gif",
+    ".svg", ".webp", ".woff", ".woff2", ".ico", ".pdf", ".zip", ".gz",
+    ".tar", ".mp4", ".webm", ".mp3", ".wav", ".otf", ".ttf",
+)
+
+# Interactive element selector — broad enough to catch most click targets,
+# tight enough to skip noise like decorative <span>s.
+_INTERACTIVE_SELECTOR = ", ".join([
+    "a[href]",
+    "button",
+    "[role='button']",
+    "[role='link']",
+    "[role='tab']",
+    "[role='menuitem']",
+    "[onclick]",
+])
+
+# ── Safety: destructive-action heuristic ─────────────────────────────────────
+# Elements whose VISIBLE text (or aria-label) matches this pattern are NEVER
+# clicked, regardless of --ajax-fill-forms mode. Protects against accidental
+# logouts, deletes, purchases, sign-outs, etc. — the kind of thing that
+# embarrasses a pentester even on an authorised engagement.
+_DESTRUCTIVE_TEXT_RE = re.compile(
+    r"\b("
+    r"delete|remove|destroy|wipe|reset"
+    r"|logout|log\s*out|sign\s*out|signout"
+    r"|unsubscribe|opt[-_\s]?out"
+    r"|cancel\s+subscription|cancel\s+account|cancel\s+order"
+    r"|pay\s+now|buy\s+now|purchase|checkout|place\s+order|confirm\s+order"
+    r"|charge\s+card|complete\s+payment|payment\b"
+    r"|disable\s+account|deactivate"
+    r"|withdraw|transfer\s+funds"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# ── Form filling: fake values, never real-looking PII ────────────────────────
+# Every value below is recognisably synthetic — the receiver (sales inbox, DB
+# admin) can immediately tell it came from an automated tool.
+def _spider_fake_value(input_type: str, name: str) -> str:
+    """Return a recognisably-fake value to type into a form field.
+    Uses obvious markers (`jspect-test+`, `Lorem ipsum jspect scan`) so the
+    recipient can tell it came from an automated scanner.
+    """
+    name_l = (name or "").lower()
+    rand_suffix = hashlib.sha1(os.urandom(8)).hexdigest()[:8]
+
+    if input_type in ("email",) or "email" in name_l or "mail" in name_l:
+        return f"jspect-test+{rand_suffix}@example.com"
+    if input_type in ("url",) or "url" in name_l or "website" in name_l:
+        return "https://example.com/jspect-test"
+    if input_type == "tel" or "phone" in name_l or "mobile" in name_l:
+        return "+15555550100"   # 555-01xx is non-dialable reserved range
+    if input_type == "number":
+        return "1"
+    if input_type == "date":
+        return "2026-01-01"
+    if input_type == "search":
+        return "jspect"
+    # Default: free text. Make sure it's obviously a test.
+    return "Lorem ipsum jspect scan test"
+
+
+# Form-fill modes: how aggressive the spider is with <form> elements.
+AJAX_FILL_MODES = ("off", "safe", "all")
+AJAX_FILL_DEFAULT = "off"
+
+# ── Scan profiles ────────────────────────────────────────────────────────────
+# A profile bundles the dozen-or-so tuning knobs the tool exposes into a single
+# `--profile` choice. Users pick one of four words ("fast", "default", "full",
+# "gentle"); individual --flag overrides win over the profile value.
+#
+# The keys here MUST match the dest names of the corresponding argparse args.
+PROFILES = {
+    "fast": {
+        # Triage scan — minutes of patience max
+        "threads": 10,
+        "rate_limit": 50,
+        "max_duration": 2,
+        "max_endpoints": 200,
+        "depth": 3,
+        "discover_levels": 1,
+        "ajax_spider": False,
+        "active_recon": False,
+        "no_wayback": True,
+    },
+    "default": {
+        # Recommended for most engagements — includes AJAX spider out of the box.
+        "threads": 10,
+        "rate_limit": 50,
+        "max_duration": 5,
+        "max_endpoints": 500,
+        "depth": 5,
+        "discover_levels": 2,
+        "ajax_spider": True,
+        "ajax_fill_forms": "off",
+        "active_recon": False,
+        "no_wayback": False,
+    },
+    "full": {
+        # Maximum coverage — turns on everything safe. Takes ~10-30 min.
+        "threads": 10,
+        "rate_limit": 50,
+        "max_duration": 10,
+        "max_endpoints": 0,      # unlimited
+        "depth": 6,
+        "discover_levels": 3,
+        "ajax_spider": True,
+        "ajax_fill_forms": "safe",
+        "active_recon": True,
+        "no_wayback": False,
+    },
+    "gentle": {
+        # Slow + single-threaded — for small / fragile / shared targets.
+        "threads": 1,
+        "rate_limit": 5,
+        "max_duration": 2,
+        "max_endpoints": 200,
+        "depth": 3,
+        "discover_levels": 1,
+        "ajax_spider": False,
+        "active_recon": False,
+        "no_wayback": True,
+    },
+}
+PROFILE_DEFAULT = "default"
+
+
+def apply_profile(args, profile_name: str) -> None:
+    """Fill in any flag the user didn't explicitly set with the value from the
+    chosen profile. Run AFTER argparse so explicit --flag values always win.
+
+    A flag is considered "unset" when its attribute is None or `[]` (empty list
+    default for repeatable args). Profile keys that aren't in `args` are ignored
+    silently so we can evolve PROFILES without breaking older argparse defs.
+    """
+    profile = PROFILES.get(profile_name, PROFILES[PROFILE_DEFAULT])
+    for key, value in profile.items():
+        if not hasattr(args, key):
+            continue
+        current = getattr(args, key)
+        if current is None or current == []:
+            setattr(args, key, value)
+
+
+def _spider_pick_pages(target: str, katana_out: Path | None, max_pages: int) -> list[str]:
+    """Pick which pages the AJAX spider should visit.
+
+    Always includes the seed URL. Adds up to `max_pages - 1` more pages from
+    katana-out.txt, skipping obvious non-HTML assets.
+    """
+    pages: list[str] = [target]
+    if not katana_out or not katana_out.exists():
+        return pages
+    seen = {target}
+    for line in katana_out.open():
+        u = line.strip()
+        if not u or u in seen or not u.startswith(("http://", "https://")):
+            continue
+        if u.split("?", 1)[0].lower().endswith(_NON_PAGE_EXTENSIONS):
+            continue
+        seen.add(u)
+        pages.append(u)
+        if len(pages) >= max_pages:
+            break
+    return pages
+
+
+def _spider_is_destructive(el) -> bool:
+    """True if the element's visible text or aria-label suggests a destructive
+    action (delete, logout, purchase, etc.) — should NEVER be clicked. Uses
+    cheap attribute reads only; doesn't trigger layout.
+    """
+    try:
+        # text_content() is cheap and doesn't force a layout flush
+        text = (el.text_content() or "").strip()
+        aria = (el.get_attribute("aria-label") or "").strip()
+        title = (el.get_attribute("title") or "").strip()
+    except Exception:
+        return False
+    blob = " ".join(s for s in (text, aria, title) if s)[:200]
+    return bool(_DESTRUCTIVE_TEXT_RE.search(blob))
+
+
+def _spider_should_skip_form(form_el, mode: str) -> tuple[bool, str]:
+    """Decide whether to skip a form based on mode + content heuristics.
+    Returns (skip, reason). Reason is a short tag for logging.
+    """
+    try:
+        method = (form_el.get_attribute("method") or "GET").upper()
+    except Exception:
+        return True, "unreadable"
+
+    # Mode-based safety gate
+    if mode == "off":
+        return True, "mode=off"
+    if mode == "safe" and method != "GET":
+        return True, f"safe mode, {method} not GET"
+
+    # Login forms — never submit. Even in 'all' mode we don't want to drive a
+    # session change with garbage credentials (locks accounts, audits trigger).
+    try:
+        if form_el.query_selector("input[type='password']"):
+            return True, "login form (has password field)"
+    except Exception:
+        pass
+
+    # Checkout / payment forms — destructive even with fake data
+    try:
+        form_text = (form_el.text_content() or "").lower()[:1000]
+    except Exception:
+        form_text = ""
+    if any(kw in form_text for kw in (
+        "credit card", "card number", "cvv", "cvc",
+        "stripe", "paypal", "checkout", "place order",
+        "complete purchase", "billing address",
+    )):
+        return True, "payment/checkout form"
+
+    return False, ""
+
+
+def _spider_fill_one_form(form_el, mode: str) -> tuple[bool, str]:
+    """Fill a single <form> with fake values and submit it.
+
+    Returns (submitted, info). Info is a short description for logging.
+    Caller is responsible for sig-deduping (each form once per page).
+    """
+    skip, reason = _spider_should_skip_form(form_el, mode)
+    if skip:
+        return False, f"skipped: {reason}"
+
+    try:
+        method = (form_el.get_attribute("method") or "GET").upper()
+        action = (form_el.get_attribute("action") or "").strip() or "(self)"
+    except Exception:
+        return False, "unreadable form"
+
+    # Fill text-ish inputs
+    filled = 0
+    try:
+        inputs = form_el.query_selector_all(
+            "input[type='text'], input[type='email'], input[type='url'], "
+            "input[type='tel'], input[type='search'], input[type='number'], "
+            "input[type='date'], input:not([type]), textarea"
+        )
+        for inp in inputs:
+            try:
+                t = (inp.get_attribute("type") or "text").lower()
+                name = inp.get_attribute("name") or ""
+                value = _spider_fake_value(t, name)
+                inp.fill(value, timeout=1500)
+                filled += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Submit — prefer the form's native submit() so any onsubmit handler fires
+    try:
+        form_el.evaluate("f => f.submit()")
+        return True, f"submitted {method} → {action[:60]} ({filled} field(s) filled)"
+    except Exception as exc:
+        return False, f"submit failed: {str(exc)[:80]}"
+
+
+def _spider_element_signature(el) -> str | None:
+    """Build a stable signature for a Playwright handle so we can dedupe across
+    re-queries within the same page. Returns None only if the element is no
+    longer attached.
+
+    We use cheap attribute reads (no inner_text — that does a layout flush and
+    can time out on heavy SPAs). Tag + href + id + first class is enough to
+    differentiate the vast majority of clickable elements.
+    """
+    try:
+        href     = (el.get_attribute("href") or "").strip()
+        el_id    = (el.get_attribute("id") or "").strip()
+        el_class = (el.get_attribute("class") or "").strip().split(" ", 1)[0]
+        tag      = (el.evaluate("e => e.tagName") or "").lower()
+    except Exception:
+        return None
+    return f"{tag}|{href}|{el_id}|{el_class}"
+
+
+def _spider_interact_with_page(page, page_url: str, target_host: str,
+                                max_clicks_per_pass: int, depth: int,
+                                click_timeout_s: int, deadline_monotonic: float,
+                                clicked_sigs: set,
+                                fill_forms_mode: str = "off") -> tuple[int, int, int, int]:
+    """Run the BFS-style click + (optional) form-fill loop on a freshly-loaded page.
+
+    Returns `(clicks_done, forms_submitted, skipped_destructive, errors)`.
+    Records discoveries via the page's request handler (caller wires it up).
+
+    The recursion is bounded by three independent caps:
+      * `depth`               — how many "click → wait → re-query" passes
+      * `max_clicks_per_pass` — clicks per pass
+      * `deadline_monotonic`  — global wallclock deadline shared across pages
+
+    `fill_forms_mode` ∈ {"off", "safe", "all"}:
+      * off  → never fill any form
+      * safe → fill + submit GET forms only (no server state change)
+      * all  → also submit POST forms with fake values (skips login/payment)
+    """
+    from playwright.sync_api import TimeoutError as PWTimeout
+    import time as _time
+    from urllib.parse import urljoin
+
+    clicks_done = 0
+    skipped_destructive = 0
+    forms_submitted = 0
+    errors = 0
+
+    for pass_n in range(depth):
+        if _time.monotonic() > deadline_monotonic:
+            break
+        try:
+            elements = page.query_selector_all(_INTERACTIVE_SELECTOR)
+        except Exception:
+            break
+        new_this_pass = 0
+
+        for el in elements[: max_clicks_per_pass]:
+            if _time.monotonic() > deadline_monotonic:
+                break
+            sig = _spider_element_signature(el)
+            if sig is None or sig in clicked_sigs:
+                continue
+
+            # Safety gate #1: destructive-action text (delete/logout/buy/etc.) —
+            # NEVER click these, regardless of form-fill mode.
+            if _spider_is_destructive(el):
+                clicked_sigs.add(sig)
+                skipped_destructive += 1
+                continue
+
+            # Safety gate #2: never let the click loop submit forms. Submit
+            # buttons (and inputs[type=submit]) inside a <form> are handled
+            # *only* by the dedicated form-fill block (which respects the
+            # off/safe/all mode + login/payment heuristics). Without this gate,
+            # `--ajax-fill-forms off` could still POST a form just by clicking
+            # its submit button.
+            try:
+                el_type = (el.get_attribute("type") or "").lower()
+                tag = (el.evaluate("e => e.tagName") or "").lower()
+                if (tag == "button" and el_type in ("", "submit")) or \
+                   (tag == "input" and el_type == "submit"):
+                    is_in_form = el.evaluate("e => !!e.closest('form')")
+                    if is_in_form:
+                        clicked_sigs.add(sig)
+                        continue
+            except Exception:
+                pass
+
+            # Cross-host link → skip without clicking (we won't follow off-site)
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                continue
+            if href.startswith(("http://", "https://", "//")):
+                try:
+                    h_host = urlparse(urljoin(page_url, href)).hostname or ""
+                except Exception:
+                    continue
+                if not _host_matches(h_host, target_host):
+                    clicked_sigs.add(sig)
+                    continue
+
+            try:
+                if not el.is_visible():
+                    continue
+                el.click(timeout=click_timeout_s * 1000, no_wait_after=True)
+                clicked_sigs.add(sig)
+                clicks_done += 1
+                new_this_pass += 1
+                try:
+                    page.wait_for_load_state("networkidle",
+                                              timeout=AJAX_SPIDER_POST_CLICK_IDLE * 1000)
+                except PWTimeout:
+                    pass
+            except Exception:
+                errors += 1
+                continue
+
+        if new_this_pass == 0:
+            break
+
+    # Form-fill pass — runs once after the click loop, only when explicitly opted-in.
+    if fill_forms_mode != "off" and _time.monotonic() < deadline_monotonic:
+        try:
+            forms = page.query_selector_all("form")
+        except Exception:
+            forms = []
+        for form_el in forms:
+            if _time.monotonic() > deadline_monotonic:
+                break
+            sig = _spider_element_signature(form_el)
+            if sig is None or sig in clicked_sigs:
+                continue
+            submitted, info = _spider_fill_one_form(form_el, fill_forms_mode)
+            clicked_sigs.add(sig)
+            if submitted:
+                forms_submitted += 1
+                Log.info(f"    {C.YELLOW}[!]{C.RESET} form-fill ({fill_forms_mode}): {info}")
+                try:
+                    page.wait_for_load_state("networkidle",
+                                              timeout=AJAX_SPIDER_POST_CLICK_IDLE * 1000)
+                except PWTimeout:
+                    pass
+            else:
+                Log.verbose(f"    [v] form-fill skipped: {info}")
+
+    return clicks_done, forms_submitted, skipped_destructive, errors
+
+
+def ajax_spider(target: str,
+                output_dir: Path,
+                headers: list,
+                katana_out: Path | None = None,
+                max_pages: int = AJAX_SPIDER_PAGES_DEFAULT,
+                max_clicks: int = AJAX_SPIDER_CLICKS_DEFAULT,
+                depth: int = AJAX_SPIDER_DEPTH,
+                fill_forms_mode: str = AJAX_FILL_DEFAULT,
+                proxy: str | None = None,
+                proxy_insecure: bool = False) -> Path | None:
+    """Stage 1b — Browser-driven AJAX spider.
+
+    Loads each page in a real headless Chromium (via Playwright), waits for SPA
+    hydration, captures every fetch / XHR / document request via DevTools
+    Protocol, then runs a depth-bounded BFS of click interactions on visible
+    same-host elements to surface routes that only register after user
+    interaction.
+
+    Discovered URLs are appended to katana-out.txt so download_js sees them in
+    Stage 2 without any other changes. A separate `ajax-spider.json` artifact
+    records what triggered each discovery (initial nav, click, post-click XHR).
+
+    Skipped gracefully if Playwright is not installed.
+    """
+    import time as _time
+    stage_header("1b", "AJAX spider (Playwright)")
+
+    # Lazy import — Playwright is heavy and optional. If it's missing, tell the
+    # user how to install it and continue with the pipeline.
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        Log.warn("Playwright not installed — skipping AJAX spider")
+        Log.info(f"    {C.DIM}↳ install with: pip install playwright && "
+                 f"playwright install chromium{C.RESET}")
+        return None
+
+    if not target:
+        Log.info("    [-] No URL target — skipped")
+        return None
+
+    target_host = urlparse(target).hostname or ""
+    if not target_host:
+        Log.warn("Could not parse target host — skipping")
+        return None
+
+    header_dict = parse_headers(headers)
+    page_urls = _spider_pick_pages(target, katana_out, max_pages)
+
+    Log.info(f"    {C.GREEN}[+]{C.RESET} Visiting {len(page_urls)} page(s) "
+             f"with headless Chromium")
+    Log.verbose(f"    [v] caps: clicks/pass={max_clicks}, depth={depth}, "
+                f"total timeout={AJAX_SPIDER_TIMEOUT}s, "
+                f"fill-forms={fill_forms_mode}")
+
+    # Loud warning when `all` mode is requested — operator must confirm ROE.
+    if fill_forms_mode == "all":
+        Log.warn("--ajax-fill-forms=all will SUBMIT POST forms with fake data — "
+                 "real emails sent, real records created. Login + payment forms "
+                 "are auto-skipped. Confirm rules of engagement before scanning.")
+    elif fill_forms_mode == "safe":
+        Log.info(f"    {C.DIM}↳ fill-forms=safe: GET forms only "
+                 f"(no server state change){C.RESET}")
+
+    # Track discovered URLs + the trigger that surfaced each one.
+    # Closure captures it because Playwright callbacks need access.
+    discovered: dict[str, str] = {}
+
+    def _record(url: str, trigger: str) -> None:
+        try:
+            u_host = urlparse(url).hostname or ""
+        except Exception:
+            return
+        if not _host_matches(u_host, target_host):
+            return
+        url = url.split("#", 1)[0]   # drop fragment
+        discovered.setdefault(url, trigger)
+
+    deadline = _time.monotonic() + AJAX_SPIDER_TIMEOUT
+    pages_visited            = 0
+    total_clicks             = 0
+    total_forms_submitted    = 0
+    total_destructive_skipped = 0
+    total_errors             = 0
+
+    try:
+        with sync_playwright() as pw:
+            launch_kwargs = {"headless": True}
+            if proxy:
+                launch_kwargs["proxy"] = {"server": proxy}
+            try:
+                browser = pw.chromium.launch(**launch_kwargs)
+            except Exception as exc:
+                Log.warn(f"Failed to launch Chromium: {exc}")
+                Log.info(f"    {C.DIM}↳ first run? try: "
+                         f"playwright install chromium{C.RESET}")
+                return None
+
+            context = browser.new_context(
+                ignore_https_errors=True,
+                extra_http_headers={k: v for k, v in header_dict.items()
+                                    if k.lower() != "user-agent"},
+                user_agent=header_dict.get("User-Agent",
+                                            "Mozilla/5.0 jspect/1.0"),
+            )
+
+            for page_url in page_urls:
+                if _time.monotonic() > deadline:
+                    Log.info(f"    {C.DIM}↳ total timeout "
+                             f"({AJAX_SPIDER_TIMEOUT}s) reached — stopping{C.RESET}")
+                    break
+
+                page = context.new_page()
+                page.on("request", lambda req: _record(req.url, "request"))
+                clicked_sigs: set = set()
+
+                try:
+                    page.goto(page_url, wait_until="domcontentloaded",
+                              timeout=AJAX_SPIDER_NAV_TIMEOUT * 1000)
+                    _record(page_url, "seed")
+                    try:
+                        page.wait_for_load_state(
+                            "networkidle",
+                            timeout=AJAX_SPIDER_NETWORK_IDLE * 1000,
+                        )
+                    except PWTimeout:
+                        pass
+
+                    n_clicks, n_forms, n_skipped, n_errs = _spider_interact_with_page(
+                        page, page_url, target_host,
+                        max_clicks, depth, AJAX_SPIDER_CLICK_TIMEOUT,
+                        deadline, clicked_sigs,
+                        fill_forms_mode=fill_forms_mode,
+                    )
+                    total_clicks += n_clicks
+                    total_forms_submitted += n_forms
+                    total_destructive_skipped += n_skipped
+                    total_errors += n_errs
+
+                    Log.verbose(f"    [v] {page_url[:60]}: {n_clicks} click(s), "
+                                f"{n_forms} form(s) submitted → "
+                                f"{len(discovered)} URLs so far")
+                    pages_visited += 1
+                except Exception as exc:
+                    Log.debug(f"page-load error for {page_url[:80]}: {exc}")
+                    total_errors += 1
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+
+            browser.close()
+    except Exception as exc:
+        Log.warn(f"AJAX spider crashed: {exc}")
+        return None
+
+    if not discovered:
+        Log.info("    [-] No new URLs surfaced")
+        return None
+
+    # Diff what we found against what Katana already had so we can label
+    # each entry "new" (= net value-add of the spider).
+    already_known = set()
+    if katana_out and katana_out.exists():
+        already_known = {l.strip() for l in katana_out.open() if l.strip()}
+    new_urls = sorted(u for u in discovered if u not in already_known)
+
+    # Append to katana-out → download_js picks them up transparently in Stage 2.
+    appended = 0
+    if katana_out:
+        try:
+            with katana_out.open("a") as fh:
+                for u in new_urls:
+                    fh.write(u + "\n")
+                    appended += 1
+        except OSError as exc:
+            Log.warn(f"could not append to katana-out.txt: {exc}")
+
+    # Write the per-URL artifact (consumed by the report).
+    spider_file = output_dir / "ajax-spider.json"
+    with spider_file.open("w") as fh:
+        for u, trigger in sorted(discovered.items()):
+            fh.write(json.dumps({
+                "url": u,
+                "trigger": trigger,
+                "new": u not in already_known,
+            }) + "\n")
+
+    summary_extras = []
+    if total_forms_submitted:
+        summary_extras.append(f"{total_forms_submitted} form(s) submitted")
+    if total_destructive_skipped:
+        summary_extras.append(f"{total_destructive_skipped} destructive element(s) skipped")
+    extras_str = " · " + " · ".join(summary_extras) if summary_extras else ""
+    Log.info(f"    {C.GREEN}[+]{C.RESET} Spider visited {pages_visited} page(s), "
+             f"{total_clicks} click(s){extras_str} → discovered {len(discovered)} URLs "
+             f"({appended} new, appended to katana-out)")
+    if total_errors:
+        Log.verbose(f"    [v] {total_errors} interaction error(s) "
+                    f"(elements gone, modals blocked, etc.)")
+
+    return spider_file
+
+
 def download_js(katana_out, output_dir, headers):
     """Download all JS URLs found by Katana using urllib (no httpx dependency)."""
-    import urllib.request
-    import urllib.error
-    import ssl
-    import hashlib
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     stage_header(2, "Downloading JS files")
@@ -800,10 +1565,6 @@ def discover_nested_js(js_clean, output_dir, headers, target, max_levels=2):
     Scan downloaded JS files for references to other JS files and fetch them.
     Catches lazy-loaded chunks and dynamic imports that Katana misses.
     """
-    import urllib.request
-    import urllib.error
-    import ssl
-    import hashlib
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     stage_header("2b", "Multi-level JS discovery")
@@ -1266,10 +2027,6 @@ def run_jsluice(target_dir, output_dir):
 
 def validate_endpoints(target, endpoints_file, output_dir, headers):
     """Hit each in-scope endpoint to determine which are live."""
-    import urllib.request
-    import urllib.error
-    import ssl
-    import re
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     stage_header(5, "Live endpoint validation")
@@ -1455,12 +2212,6 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
       2. JSON file discovery (Swagger/OpenAPI, config files, sensitive keys)
       3. Developer comments (TODO/FIXME, internal URLs, credential mentions)
     """
-    import urllib.request
-    import urllib.error
-    import ssl
-    import base64
-    import hashlib
-
     stage_header("5b", "Static metadata analysis (maps, JSON, comments)")
 
     target_parsed = urlparse(target)
@@ -1822,12 +2573,6 @@ def query_wayback_maps(target: str, output_dir: Path, headers: list[str]) -> dic
       wayback_maps_count – int
       wayback_only_count – int  (maps not reachable on live site)
     """
-    import urllib.request
-    import urllib.error
-    import ssl
-    import hashlib
-    import time
-
     stage_header("5d", "Wayback Machine — historical source map discovery")
 
     if not target:
@@ -2045,7 +2790,6 @@ def _google_cse_search(query: str, api_key: str, cse_id: str,
     """Hit Google Custom Search JSON API. Returns list of result URLs.
     Free tier: 100 queries/day. Silent failure on quota / network errors.
     """
-    import urllib.request
     import urllib.parse as _up
     urls: list[str] = []
     for start in range(1, min(max_results, 100) + 1, 10):
@@ -2075,7 +2819,6 @@ def _google_cse_search(query: str, api_key: str, cse_id: str,
 
 def _query_cdx_for_ext(domain: str, ext: str, limit: int = 200) -> list[tuple[str, str]]:
     """Query the Wayback CDX API for one extension. Returns [(orig_url, timestamp), …]."""
-    import urllib.request
     import urllib.parse as _up
     params = {
         "url":      f"{domain}/*.{ext}",
@@ -2139,10 +2882,6 @@ def active_recon_discovery(target: str, output_dir: Path, headers: list[str],
 
     Returns counters for the report.
     """
-    import urllib.request
-    import hashlib
-    import time
-
     stage_header("4b", "Active recon — Google dorks + broad Wayback discovery")
 
     if not target:
@@ -4479,6 +5218,8 @@ def generate_report(target, output_dir, results):
         ("#summary",     "Summary",       "", True),
         ("#endpoints",   "Endpoints",     "has-findings" if results.get("endpoint_count",0) else "",
             bool(results.get("endpoint_count", 0))),
+        ("#ajax-spider", "AJAX",          "has-findings" if results.get("ajax_spider_count",0) else "",
+            bool(results.get("ajax_spider_count", 0))),
         ("#live",        "Live",          "has-findings" if results.get("live_count",0) else "",
             bool(results.get("live_count", 0))),
         ("#http-calls",  "HTTP Calls",    "has-findings" if results.get("http_calls_count",0) else "",
@@ -4573,6 +5314,8 @@ def generate_report(target, output_dir, results):
     parts.append("<div class='summary-grid'>")
     stats = [
         ("URLs crawled",          results.get("url_count", 0),              ""),
+        ("AJAX-spider URLs",      results.get("ajax_spider_count", 0),
+         "success" if results.get("ajax_spider_count", 0) else ""),
         ("JS files",              results.get("js_count", 0),               ""),
         ("Endpoints found",       results.get("endpoint_count", 0),         ""),
         ("Live endpoints",        results.get("live_count", 0),             ""),
@@ -4806,6 +5549,83 @@ def generate_report(target, output_dir, results):
             parts.append(end_sub())
 
     parts.append(end_section())
+
+    # ── AJAX spider ──────────────────────────────────────────────────
+    spider_rows = parse_jsonl(results.get("ajax_spider_file"))
+    if spider_rows:
+        spider_new = [r for r in spider_rows if r.get("new")]
+        spider_known = [r for r in spider_rows if not r.get("new")]
+        # By-trigger counts
+        from collections import Counter as _Counter
+        by_trigger = _Counter(r.get("trigger", "?") for r in spider_rows)
+
+        parts.append(section(
+            "ajax-spider", "AJAX Spider (runtime URL discovery)",
+            f"{len(spider_rows)} captured, {len(spider_new)} new",
+            "success" if spider_new else "neutral",
+            open_=bool(spider_new),
+        ))
+        parts.append(
+            "<p class='empty'>Headless Chromium loaded each page, waited for SPA "
+            "hydration, then BFS-clicked visible same-host links/buttons. Every "
+            "<code>fetch</code> / <code>XHR</code> / document request the page "
+            "made was captured via the Chrome DevTools Protocol. "
+            "<strong>New URLs</strong> are those the static crawler (Katana) didn't already have — "
+            "exactly the URLs you'd miss without browser execution.</p>"
+        )
+        # Compact summary line
+        trig_str = ", ".join(f"{n}× <code>{html_escape(k)}</code>"
+                              for k, n in by_trigger.most_common())
+        parts.append(f"<p><strong>By trigger:</strong> {trig_str}</p>")
+
+        if spider_new:
+            parts.append(sub("New (not in Katana output)", len(spider_new),
+                              "success", open_=True))
+            parts.append("<table><thead><tr>"
+                         "<th>URL</th><th>Trigger</th>"
+                         "</tr></thead><tbody>")
+            for r in spider_new[:100]:
+                url_safe = html_escape(r.get("url", ""))
+                # NOTE: don't name this `copy_btn` — outer scope has a function
+                # with that name and shadowing it breaks subsequent sections.
+                url_copy_btn = (f"<button class='copy-btn' data-copy='{url_safe}' "
+                                f"title='Copy URL'>⧉</button>" if r.get("url") else "")
+                parts.append(
+                    f"<tr><td><code>{url_safe}</code>{url_copy_btn}</td>"
+                    f"<td><span class='badge neutral'>"
+                    f"{html_escape(r.get('trigger', '?'))}</span></td></tr>"
+                )
+            if len(spider_new) > 100:
+                parts.append(
+                    f"<tr><td colspan='2' class='empty'>"
+                    f"{len(spider_new) - 100} more — see ajax-spider.json</td></tr>"
+                )
+            parts.append("</tbody></table>")
+            parts.append(end_sub())
+
+        if spider_known:
+            parts.append(sub("Already in Katana output", len(spider_known),
+                              "neutral", open_=False))
+            parts.append("<p class='empty'>Captured at runtime but Katana's "
+                         "static crawl already had them. Useful confirmation "
+                         "that the static surface matches the dynamic one.</p>")
+            parts.append("<table><thead><tr>"
+                         "<th>URL</th><th>Trigger</th></tr></thead><tbody>")
+            for r in spider_known[:50]:
+                parts.append(
+                    f"<tr><td><code>{html_escape(r.get('url', ''))}</code></td>"
+                    f"<td><span class='badge neutral'>"
+                    f"{html_escape(r.get('trigger', '?'))}</span></td></tr>"
+                )
+            if len(spider_known) > 50:
+                parts.append(
+                    f"<tr><td colspan='2' class='empty'>"
+                    f"{len(spider_known) - 50} more — see ajax-spider.json</td></tr>"
+                )
+            parts.append("</tbody></table>")
+            parts.append(end_sub())
+
+        parts.append(end_section())
 
     # ── Live endpoints ───────────────────────────────────────────────
     live_eps = parse_jsonl(results.get("live_endpoints_file"))
@@ -5498,6 +6318,903 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
 
 # ---------- Main ----------
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal interactive wizard (--interactive / -i)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wiz_print_banner_header() -> None:
+    print(BANNER)
+    print(f"{C.BOLD}{C.CYAN}Interactive setup{C.RESET}  ·  press Ctrl+C to abort\n")
+
+
+def _wiz_ask(prompt: str, default: str = "", required: bool = False) -> str:
+    """One free-text input with a [default] shown when present. Loops on empty
+    when `required=True`.
+    """
+    suffix = f" {C.DIM}[{default}]{C.RESET}" if default else ""
+    while True:
+        try:
+            raw = input(f"  {prompt}{suffix}\n  > ").strip()
+        except EOFError:
+            raw = ""
+        if not raw:
+            raw = default
+        if raw or not required:
+            return raw
+        print(f"    {C.YELLOW}value required{C.RESET}")
+
+
+def _wiz_ask_choice(prompt: str, choices: list, default: str) -> str:
+    """Numbered menu — accepts the number OR the literal value (case-insensitive)."""
+    print(f"  {prompt}")
+    for i, c in enumerate(choices, 1):
+        marker = " ← default" if c == default else ""
+        print(f"    {C.DIM}[{i}]{C.RESET} {c}{C.DIM}{marker}{C.RESET}")
+    while True:
+        try:
+            raw = input(f"  > {C.DIM}[{default}]{C.RESET} ").strip().lower()
+        except EOFError:
+            raw = ""
+        if not raw:
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            return choices[int(raw) - 1]
+        for c in choices:
+            if raw == c.lower():
+                return c
+        print(f"    {C.YELLOW}pick a number 1-{len(choices)} or the literal name{C.RESET}")
+
+
+def _wiz_ask_headers() -> list:
+    """Collect repeatable -H "Name: value" headers. Enter on an empty line to finish."""
+    headers: list = []
+    print("  Auth headers (paste one per line, Enter on empty line to finish):")
+    print(f"  {C.DIM}examples: Cookie: session=abc   /   Authorization: Bearer eyJ...{C.RESET}")
+    while True:
+        try:
+            raw = input(f"  > ").strip()
+        except EOFError:
+            break
+        if not raw:
+            break
+        if ":" not in raw:
+            print(f"    {C.YELLOW}header must contain ':' (Name: value) — skipped{C.RESET}")
+            continue
+        headers.append(raw)
+        print(f"    {C.GREEN}added{C.RESET} ({len(headers)} total)")
+    return headers
+
+
+def _wiz_equivalent_cli(args) -> str:
+    """Build the CLI you'd type to repeat this scan without the wizard."""
+    parts = ["jspect"]
+    if args.url:
+        parts.append(f"-u {args.url}")
+    if args.dir:
+        parts.append(f"--dir {args.dir}")
+    for h in args.header or []:
+        parts.append(f'-H "{h}"')
+    if args.profile != PROFILE_DEFAULT:
+        parts.append(f"--profile {args.profile}")
+    if args.proxy:
+        parts.append(f"--proxy {args.proxy}")
+    if args.proxy_insecure:
+        parts.append("--proxy-insecure")
+    if args.ajax_fill_forms and args.ajax_fill_forms != "off":
+        parts.append(f"--ajax-fill-forms {args.ajax_fill_forms}")
+    if args.output:
+        parts.append(f"-o {args.output}")
+    return " ".join(parts)
+
+
+def interactive_setup(args) -> None:
+    """Walk the user through the minimum questions to start a scan. Mutates the
+    passed `args` Namespace in place.
+
+    Only 5 questions, all with defaults — Enter accepts the suggestion. Calls
+    `apply_profile()` again afterwards in case the user changed the profile.
+    """
+    _wiz_print_banner_header()
+
+    # [1/5] target — accepts URL, local path, OR a path to a Burp request file
+    print(f"  {C.BOLD}[1/5]{C.RESET} Target")
+    print(f"  {C.DIM}Tip: prefix with 'burp:' to paste a raw HTTP request "
+          f"(e.g. burp:/tmp/req.txt) — URL + cookies + headers auto-extracted.{C.RESET}")
+    target = _wiz_ask(
+        "  URL to scan, local path, or burp:FILE:",
+        default=args.url or args.dir or "",
+        required=True,
+    )
+    if target.startswith("burp:"):
+        burp_path = target[len("burp:"):].strip()
+        if not burp_path:
+            print(f"    {C.YELLOW}empty path after 'burp:' — falling back to manual entry{C.RESET}")
+        else:
+            try:
+                raw = Path(burp_path).read_text(encoding="utf-8", errors="replace")
+                parsed = _parse_raw_http_request(raw)
+                args.url = parsed["url"]
+                args.header = parsed["headers"] + (args.header or [])
+                print(f"    {C.GREEN}✓{C.RESET} parsed Burp request "
+                      f"→ {C.BOLD}{parsed['url']}{C.RESET} "
+                      f"({len(parsed['headers'])} header(s) extracted)")
+            except (OSError, ValueError) as exc:
+                print(f"    {C.RED}✗{C.RESET} parse failed: {exc}")
+                sys.exit(1)
+    elif target.startswith(("file://", "/")) or Path(target).is_dir():
+        # Treat as local source directory
+        args.dir = target.replace("file://", "")
+        args.url = args.url or None
+    else:
+        # Treat as URL — accept bare hostname and add https://
+        if not target.startswith(("http://", "https://")):
+            target = "https://" + target
+        args.url = target
+    print()
+
+    # [2/5] auth — skipped if a Burp request already supplied headers
+    print(f"  {C.BOLD}[2/5]{C.RESET} Authentication (optional)")
+    if args.header:
+        print(f"    {C.DIM}↳ already have {len(args.header)} header(s) from Burp parse — "
+              f"add more or press Enter to keep just these{C.RESET}")
+    new_headers = _wiz_ask_headers()
+    if new_headers:
+        args.header = (args.header or []) + new_headers
+    print()
+
+    # [3/5] profile
+    print(f"  {C.BOLD}[3/5]{C.RESET} Scan profile")
+    args.profile = _wiz_ask_choice(
+        "  Pick intensity:",
+        choices=list(PROFILES),
+        default=args.profile or PROFILE_DEFAULT,
+    )
+    print()
+
+    # [4/5] proxy
+    print(f"  {C.BOLD}[4/5]{C.RESET} Proxy (optional)")
+    proxy = _wiz_ask(
+        "  Proxy URL (Burp/mitmproxy/Tor) — Enter to skip:",
+        default=args.proxy or "",
+    )
+    if proxy:
+        args.proxy = proxy
+        # Burp ships a self-signed CA → enable insecure mode automatically
+        if "127.0.0.1" in proxy or "host.docker.internal" in proxy:
+            args.proxy_insecure = True
+            print(f"    {C.DIM}↳ enabling --proxy-insecure (self-signed CA assumed){C.RESET}")
+    print()
+
+    # [5/5] form-fill mode (only matters with AJAX spider on — profile decides that)
+    spider_active = (PROFILES.get(args.profile) or {}).get("ajax_spider", False)
+    if spider_active:
+        print(f"  {C.BOLD}[5/5]{C.RESET} AJAX spider — form handling")
+        args.ajax_fill_forms = _wiz_ask_choice(
+            "  How to handle <form> elements:",
+            choices=list(AJAX_FILL_MODES),
+            default=args.ajax_fill_forms or AJAX_FILL_DEFAULT,
+        )
+    else:
+        print(f"  {C.DIM}[5/5]{C.RESET} {C.DIM}Form handling — skipped (AJAX spider off in this profile){C.RESET}")
+    print()
+
+    # Re-apply profile in case --profile changed during interaction. Reset
+    # every profile-managed flag back to None first so the new profile values
+    # actually take effect (apply_profile only overwrites None/[]).
+    for key in PROFILES.get(args.profile, {}):
+        if hasattr(args, key):
+            setattr(args, key, None)
+    apply_profile(args, args.profile)
+
+    # Show equivalent CLI + confirm
+    print(f"{C.BOLD}{C.CYAN}─" * 60 + C.RESET)
+    print(f"{C.BOLD}Equivalent CLI:{C.RESET}")
+    print(f"  {C.GREEN}{_wiz_equivalent_cli(args)}{C.RESET}")
+    print()
+    confirm = _wiz_ask("Run now? (Y/n)", default="Y")
+    if confirm.lower() not in ("y", "yes", ""):
+        print(f"  {C.YELLOW}aborted{C.RESET}")
+        sys.exit(0)
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Web wizard (--serve)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Embedded HTML/CSS/JS for the single-page wizard. Kept inline so the server
+# is one self-contained file — drops into any pentest box without assets.
+_WEB_FORM_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>jspect</title>
+<style>
+:root {
+    --bg:#0f1115; --surface:#171a21; --surface-2:#1f242e; --border:#2a303c;
+    --text:#e6e8ec; --dim:#8b93a3; --accent:#5eead4;
+    --error:#ef4444; --warn:#f59e0b; --ok:#10b981;
+}
+* { box-sizing: border-box; }
+body { font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:var(--bg); color:var(--text); margin:0; padding:40px 20px; }
+.container { max-width:680px; margin:0 auto; }
+h1 { font-size:28px; margin:0 0 6px; color:var(--accent); font-weight:600; letter-spacing:-0.5px;}
+h1 span { color:var(--text); }
+.tag { color:var(--dim); font-size:13px; margin-bottom:32px; }
+form { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+       padding:24px; }
+label { display:block; font-weight:600; margin:14px 0 6px; font-size:13px; }
+label small { color:var(--dim); font-weight:normal; margin-left:6px; }
+input[type=text], input[type=url], select, textarea {
+    width:100%; padding:9px 12px; background:var(--bg); color:var(--text);
+    border:1px solid var(--border); border-radius:5px; font:13px monospace;
+}
+input:focus, select:focus, textarea:focus { outline:1px solid var(--accent); border-color:var(--accent); }
+textarea { min-height:60px; resize:vertical; }
+.profiles { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin:8px 0 4px; }
+.profiles label { display:flex; align-items:flex-start; padding:12px; margin:0;
+    background:var(--surface-2); border:2px solid var(--border); border-radius:6px;
+    cursor:pointer; font-weight:normal; transition:border .12s; }
+.profiles label:has(input:checked) { border-color:var(--accent); background:var(--bg); }
+.profiles input { margin-right:10px; margin-top:3px; }
+.profiles strong { display:block; color:var(--text); margin-bottom:3px; font-size:13px; }
+.profiles span { color:var(--dim); font-size:11px; }
+details { margin-top:16px; }
+summary { cursor:pointer; color:var(--dim); padding:6px 0; user-select:none; }
+summary:hover { color:var(--text); }
+.row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+button { background:var(--accent); color:var(--bg); border:0; padding:12px 20px;
+    border-radius:6px; font-weight:600; font-size:14px; cursor:pointer;
+    margin-top:20px; width:100%; }
+button:hover { filter:brightness(1.1); }
+button:disabled { opacity:0.4; cursor:not-allowed; }
+.footer { text-align:center; color:var(--dim); font-size:11px; margin-top:30px; }
+.notice { background:rgba(245,158,11,0.1); border-left:3px solid var(--warn);
+    padding:10px 14px; border-radius:4px; margin-top:12px; font-size:12px; color:var(--dim);}
+.tabs { display:flex; gap:2px; border-bottom:1px solid var(--border); margin-bottom:14px; }
+.tab { background:transparent; color:var(--dim); border:0; padding:8px 14px;
+    cursor:pointer; font-size:13px; border-bottom:2px solid transparent; margin-bottom:-1px;
+    border-radius:0; width:auto; margin-top:0; font-weight:normal; }
+.tab:hover { color:var(--text); }
+.tab.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
+.tab-panel { animation: fadein .15s ease-in; }
+@keyframes fadein { from { opacity:0 } to { opacity:1 } }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔍 <span>jspect</span></h1>
+  <div class="tag">JavaScript security analysis pipeline · web wizard</div>
+
+  <form id="scanForm" method="POST" action="/scan">
+
+    <div class="tabs">
+      <button type="button" class="tab active" data-target="tab-url">URL + headers</button>
+      <button type="button" class="tab" data-target="tab-burp">Paste Burp request</button>
+    </div>
+
+    <div id="tab-url" class="tab-panel active">
+      <label for="target">Target <small>URL or local path</small></label>
+      <input type="text" id="target" name="target" placeholder="https://example.com" autofocus>
+
+      <label for="headers">Auth headers <small>one per line, optional</small></label>
+      <textarea id="headers" name="headers" placeholder="Cookie: session=abc123&#10;Authorization: Bearer eyJ..."></textarea>
+    </div>
+
+    <div id="tab-burp" class="tab-panel" style="display:none">
+      <label for="burp_request">Raw HTTP request <small>paste straight from Burp / curl -v / mitmproxy</small></label>
+      <textarea id="burp_request" name="burp_request" rows="10" placeholder="GET /api/users?page=2 HTTP/1.1&#10;Host: target.com&#10;Cookie: session=abc123&#10;Authorization: Bearer eyJ...&#10;&#10;"></textarea>
+      <div class="notice"><strong>Auto-extracted:</strong> URL (from Host + path) · Cookies · Authorization · X-*-Token · Origin. Transport-noise headers (User-Agent, Accept, Connection, Sec-*, etc.) are stripped. HTTP/2 pseudo-headers are supported.</div>
+    </div>
+
+    <label>Profile</label>
+    <div class="profiles">
+      <label><input type="radio" name="profile" value="fast"><div><strong>fast</strong><span>triage (~30s)</span></div></label>
+      <label><input type="radio" name="profile" value="default" checked><div><strong>default</strong><span>recommended (~2-5m)</span></div></label>
+      <label><input type="radio" name="profile" value="full"><div><strong>full</strong><span>everything (~10-30m)</span></div></label>
+      <label><input type="radio" name="profile" value="gentle"><div><strong>gentle</strong><span>1 thread, polite</span></div></label>
+    </div>
+
+    <details>
+      <summary>+ Advanced options</summary>
+      <div class="row">
+        <div>
+          <label for="proxy">Proxy <small>Burp/mitmproxy</small></label>
+          <input type="text" id="proxy" name="proxy" placeholder="http://127.0.0.1:8080">
+        </div>
+        <div>
+          <label for="output">Output dir <small>optional</small></label>
+          <input type="text" id="output" name="output" placeholder="(auto-timestamped)">
+        </div>
+      </div>
+      <label for="formfill">AJAX form filling <small>POST forms = real submissions</small></label>
+      <select id="formfill" name="ajax_fill_forms">
+        <option value="off" selected>off — never touch forms</option>
+        <option value="safe">safe — GET forms only</option>
+        <option value="all">all — POST too (login/payment skipped)</option>
+      </select>
+      <div class="notice"><strong>Heads up:</strong> mode=<code>all</code> submits real forms with obviously-fake data. Confirm rules of engagement before scanning third-party sites.</div>
+    </details>
+
+    <button type="submit">Start scan</button>
+  </form>
+
+  <div class="footer">
+    <a href="/scans" style="color:#5eead4;text-decoration:none">📁 Previous scans</a>
+    &nbsp;·&nbsp; localhost only &nbsp;·&nbsp; single scan at a time &nbsp;·&nbsp; stdlib only
+  </div>
+</div>
+<script>
+// Tab switcher between "URL + headers" and "Paste Burp request"
+document.querySelectorAll('.tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+        btn.classList.add('active');
+        const panel = document.getElementById(btn.dataset.target);
+        if (panel) panel.style.display = '';
+    });
+});
+// If user pastes a Burp request, drop the `required` attribute from the URL
+// field so submission can succeed even without it. The server detects which
+// to use by checking which input is non-empty.
+const targetInput = document.getElementById('target');
+const burpArea = document.getElementById('burp_request');
+function syncRequired() {
+    if (burpArea.value.trim()) targetInput.removeAttribute('required');
+    else targetInput.setAttribute('required', '');
+}
+burpArea.addEventListener('input', syncRequired);
+document.getElementById('scanForm').addEventListener('submit', syncRequired);
+</script>
+</body>
+</html>
+"""
+
+_WEB_PROGRESS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><title>jspect · scanning {target}</title>
+<style>
+:root { --bg:#0f1115; --surface:#171a21; --border:#2a303c; --text:#e6e8ec;
+        --dim:#8b93a3; --accent:#5eead4; --ok:#10b981; --warn:#f59e0b; --err:#ef4444; }
+body { font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:var(--bg); color:var(--text); margin:0; padding:24px; }
+.container { max-width:880px; margin:0 auto; }
+h1 { font-size:18px; margin:0 0 4px; color:var(--accent); font-weight:600; }
+.target { color:var(--dim); font-family:monospace; font-size:12px; margin-bottom:18px; }
+.actions { margin:14px 0 20px; display:flex; gap:10px; }
+.btn { padding:8px 16px; border-radius:5px; background:var(--surface); color:var(--text);
+       border:1px solid var(--border); text-decoration:none; font-size:12px; cursor:pointer;}
+.btn:hover { border-color:var(--accent); }
+.btn.primary { background:var(--accent); color:var(--bg); border-color:var(--accent); font-weight:600;}
+.btn.danger { background:transparent; color:var(--err); border-color:var(--err); cursor:pointer; }
+.btn.danger:hover { background:var(--err); color:var(--bg); }
+.btn[disabled] { opacity:0.4; pointer-events:none; }
+#status { font-size:12px; color:var(--dim); margin-left:auto; align-self:center;}
+#status.running::before { content:"● "; color:var(--warn); }
+#status.done::before    { content:"● "; color:var(--ok); }
+#status.crashed::before { content:"● "; color:var(--err); }
+#log { background:#0a0c10; border:1px solid var(--border); border-radius:6px;
+       padding:16px; font-family:monospace; font-size:12px; white-space:pre-wrap;
+       height:520px; overflow-y:auto; line-height:1.45; }
+.log-stage { color:var(--accent); font-weight:600; }
+.log-warn  { color:var(--warn); }
+.log-err   { color:var(--err);  font-weight:600; }
+.log-ok    { color:var(--ok); }
+.log-dim   { color:var(--dim); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🔍 jspect — scanning</h1>
+  <div class="target">{target}</div>
+  <div class="actions">
+    <a class="btn primary" id="reportBtn" disabled>Open report</a>
+    <a class="btn" id="dirBtn" disabled>Browse artifacts</a>
+    <button type="button" class="btn danger" id="stopBtn">Stop scan</button>
+    <a class="btn" href="/">+ New scan</a>
+    <div id="status" class="running">running…</div>
+  </div>
+  <div id="log"></div>
+</div>
+<script>
+const log = document.getElementById('log');
+const reportBtn = document.getElementById('reportBtn');
+const dirBtn = document.getElementById('dirBtn');
+const stopBtn = document.getElementById('stopBtn');
+const status = document.getElementById('status');
+const jobId = "{job_id}";
+
+stopBtn.addEventListener('click', async () => {{
+    if (!confirm('Stop the running scan? Partial results will be lost.')) return;
+    stopBtn.disabled = true;
+    stopBtn.textContent = 'stopping…';
+    try {{
+        await fetch('/jobs/' + jobId + '/cancel', {{method: 'POST'}});
+    }} catch (e) {{
+        stopBtn.textContent = 'stop failed';
+    }}
+}});
+
+function markFinished() {{
+    stopBtn.style.display = 'none';
+}}
+
+const es = new EventSource('/events/' + jobId);
+es.onmessage = (ev) => {{
+    if (ev.data === '__DONE__') {{
+        es.close();
+        status.textContent = 'done';
+        status.className = 'done';
+        reportBtn.removeAttribute('disabled');
+        reportBtn.href = '/jobs/' + jobId + '/report';
+        dirBtn.removeAttribute('disabled');
+        dirBtn.href = '/jobs/' + jobId + '/files/';
+        markFinished();
+        return;
+    }}
+    if (ev.data === '__CRASHED__') {{
+        es.close();
+        status.textContent = (stopBtn.textContent === 'stopping…') ? 'cancelled' : 'crashed';
+        status.className = 'crashed';
+        // Even on cancel, the report dir exists and probably has partial artifacts
+        dirBtn.removeAttribute('disabled');
+        dirBtn.href = '/jobs/' + jobId + '/files/';
+        markFinished();
+        return;
+    }}
+    const line = ev.data;
+    const div = document.createElement('div');
+    if (line.includes('[*] Stage'))      div.className = 'log-stage';
+    else if (line.includes('[!]'))       div.className = 'log-warn';
+    else if (line.includes('[✗]') || line.includes('Traceback')) div.className = 'log-err';
+    else if (line.includes('[+]'))       div.className = 'log-ok';
+    else if (line.includes('[v]') || line.includes('[i]')) div.className = 'log-dim';
+    div.textContent = line;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+}};
+es.onerror = () => {{ status.textContent = 'lost connection'; status.className = 'crashed'; }};
+</script>
+</body>
+</html>
+"""
+
+# ── Web wizard tunables ──────────────────────────────────────────────────────
+WEB_PORT_DEFAULT       = 8765       # also reflected in argparse default
+WEB_BIND_DEFAULT       = "127.0.0.1"
+WEB_LOG_QUEUE_MAX      = 10_000     # cap per-job log queue (drops oldest entries beyond this)
+WEB_CANCEL_GRACE_S     = 3          # SIGTERM grace before SIGKILL on /cancel
+WEB_SSE_KEEPALIVE_S    = 30         # idle ping interval on /events/<id>
+WEB_JOB_ID_BYTES       = 8          # bytes of entropy in secrets.token_urlsafe()
+WEB_DEFAULT_SCAN_ROOT  = Path("/tmp/jspect-web")   # where /scans listing reads from
+
+# Job registry (in-memory — server is single-user, single-scan)
+import threading as _threading
+import queue as _queue
+_JOBS: dict = {}    # job_id -> {"process": Popen, "log_q": Queue, "output_dir": Path, "target": str, "status": "running"|"done"|"crashed"}
+_JOB_LOCK = _threading.Lock()
+
+
+# ── Shared file-serving helpers (DRY across /jobs/<id>/files and /scans/<dir>/files) ──
+
+def _web_render_dir_listing(p: Path, base: Path, url_prefix: str, back_link: tuple[str, str]) -> str:
+    """Render the simple file-browser page for a directory.
+    `url_prefix` is the URL stem to prepend to each link (e.g. '/jobs/<id>/files'
+    or '/scans/<dir>/files'). `back_link` is (href, label) for the bottom-of-page
+    "back" link. Returns full HTML.
+    """
+    rows = []
+    if p != base:
+        parent_rel = p.parent.resolve().relative_to(base)
+        rows.append(f'<li><a href="{url_prefix}/{parent_rel}">../</a></li>')
+    for item in sorted(p.iterdir()):
+        rel = item.resolve().relative_to(base)
+        suffix = "/" if item.is_dir() else ""
+        rows.append(
+            f'<li><a href="{url_prefix}/{rel}{suffix}">'
+            f'{html_escape(item.name)}{suffix}</a></li>'
+        )
+    return (
+        f"<style>body{{font:13px monospace;background:#0f1115;color:#e6e8ec;padding:24px}}"
+        f"h2{{color:#5eead4;margin-top:0}} ul{{padding-left:18px}} li{{margin:2px 0}}"
+        f"a{{color:#5eead4;text-decoration:none}} a:hover{{text-decoration:underline}}</style>"
+        f"<h2>📁 {html_escape(str(p))}</h2>"
+        f"<ul>{''.join(rows)}</ul>"
+        f"<p style='margin-top:18px'><a href='{back_link[0]}'>{html_escape(back_link[1])}</a></p>"
+    )
+
+
+def _web_guess_content_type(suffix: str) -> str:
+    """Map a file suffix to a Content-Type the browser will render usefully."""
+    return {
+        ".html":  "text/html",
+        ".json":  "application/json",
+        ".xml":   "application/xml",
+        ".js":    "application/javascript",
+        ".css":   "text/css",
+        ".svg":   "image/svg+xml",
+        ".png":   "image/png",
+        ".jpg":   "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif":   "image/gif",
+    }.get(suffix.lower(), "text/plain")
+
+
+def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> None:
+    """Run jspect again as a subprocess so its stdout streams cleanly per-job.
+    Pushes each output line into the job's Queue for SSE consumption."""
+    import subprocess as _subprocess
+    cmd = [sys.executable, __file__]
+    if args_dict.get("url"):        cmd += ["-u", args_dict["url"]]
+    if args_dict.get("dir"):        cmd += ["--dir", args_dict["dir"]]
+    for h in args_dict.get("header", []) or []:
+        cmd += ["-H", h]
+    if args_dict.get("profile"):    cmd += ["--profile", args_dict["profile"]]
+    if args_dict.get("proxy"):      cmd += ["--proxy", args_dict["proxy"]]
+    if args_dict.get("proxy_insecure"): cmd += ["--proxy-insecure"]
+    if args_dict.get("ajax_fill_forms") and args_dict["ajax_fill_forms"] != "off":
+        cmd += ["--ajax-fill-forms", args_dict["ajax_fill_forms"]]
+    cmd += ["-o", str(output_dir)]
+
+    log_q = _JOBS[job_id]["log_q"]
+    log_q.put(f"$ {' '.join(cmd)}")
+
+    try:
+        env = os.environ.copy()
+        env["NO_COLOR"] = "1"   # strip ANSI in subprocess output for cleaner web display
+        proc = _subprocess.Popen(cmd, stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
+                                  text=True, bufsize=1, env=env)
+        _JOBS[job_id]["process"] = proc
+        for line in iter(proc.stdout.readline, ""):
+            # Strip residual ANSI if any
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n"))
+            log_q.put(clean)
+        proc.stdout.close()
+        rc = proc.wait()
+        _JOBS[job_id]["status"] = "done" if rc == 0 else "crashed"
+        log_q.put("__DONE__" if rc == 0 else "__CRASHED__")
+    except Exception as exc:
+        log_q.put(f"!! launcher error: {exc}")
+        _JOBS[job_id]["status"] = "crashed"
+        log_q.put("__CRASHED__")
+
+
+def run_web_wizard(args) -> None:
+    """Spin up a small HTTP server (single-user, localhost-only by default)
+    serving a form + live scan output via SSE."""
+    import http.server as _hs
+    import urllib.parse as _up
+    import shutil as _shutil
+
+    bind = args.bind
+    port = args.port
+
+    class Handler(_hs.BaseHTTPRequestHandler):
+        # Quiet the default access log (we have richer log output elsewhere).
+        def log_message(self, *_): pass
+
+        def _send_html(self, body: str, status: int = 200) -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _send_redirect(self, location: str) -> None:
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            if self.path == "/" or self.path == "/index.html":
+                self._send_html(_WEB_FORM_HTML)
+                return
+
+            # ── /scans — list every past scan directory on disk ──────────────
+            # Each entry is a directory under /tmp/jspect-web/ (the default
+            # output location for web jobs). Clicking one lands you on the
+            # same /files/ tree the live progress page links to, AND on the
+            # report if present. Survives server restarts.
+            if self.path == "/scans" or self.path == "/scans/":
+                web_root = Path("/tmp/jspect-web")
+                scans = []
+                if web_root.is_dir():
+                    for d in sorted(web_root.iterdir(),
+                                     key=lambda p: p.stat().st_mtime, reverse=True):
+                        if not d.is_dir():
+                            continue
+                        # Parse "jspect-<host>-<YYYYMMDD>-<HHMMSS>" → host + ts
+                        m = re.match(r"jspect-(.+)-(\d{8}-\d{6})$", d.name)
+                        host = m.group(1) if m else d.name
+                        ts   = m.group(2) if m else ""
+                        size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                        has_report = (d / "report.html").exists()
+                        scans.append((d.name, host, ts, size, has_report))
+                rows = []
+                if not scans:
+                    rows.append('<tr><td colspan="4" class="empty">No past scans in /tmp/jspect-web/</td></tr>')
+                else:
+                    for name, host, ts, size, has_report in scans:
+                        ts_fmt = (f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}:{ts[13:15]}"
+                                   if len(ts) == 15 else ts)
+                        size_kb = f"{size/1024:.0f} KB" if size < 1_048_576 else f"{size/1_048_576:.1f} MB"
+                        report_btn = (f'<a class="btn primary" href="/scans/{html_escape(name)}/report">report</a>'
+                                       if has_report else '<span class="empty">—</span>')
+                        rows.append(
+                            f'<tr><td><code>{html_escape(host)}</code></td>'
+                            f'<td>{html_escape(ts_fmt)}</td>'
+                            f'<td>{size_kb}</td>'
+                            f'<td>{report_btn} '
+                            f'<a class="btn" href="/scans/{html_escape(name)}/files/">browse</a></td></tr>'
+                        )
+                self._send_html(f"""<!doctype html><html><head><meta charset="utf-8">
+<title>jspect · previous scans</title>
+<style>
+body {{ font:13px -apple-system,sans-serif; background:#0f1115; color:#e6e8ec; margin:0; padding:24px; }}
+.container {{ max-width:880px; margin:0 auto; }}
+h1 {{ color:#5eead4; font-size:20px; margin:0 0 18px; }}
+table {{ border-collapse:collapse; width:100%; margin-top:12px; }}
+th,td {{ text-align:left; padding:10px 14px; border-bottom:1px solid #2a303c; font-size:13px; }}
+th {{ color:#8b93a3; text-transform:uppercase; font-size:11px; letter-spacing:.5px; }}
+tr:hover {{ background:#171a21; }}
+.empty {{ color:#8b93a3; text-align:center; }}
+.btn {{ padding:5px 10px; border:1px solid #2a303c; border-radius:4px;
+       background:#171a21; color:#e6e8ec; text-decoration:none; font-size:11px; margin-right:4px;}}
+.btn:hover {{ border-color:#5eead4; }}
+.btn.primary {{ background:#5eead4; color:#0f1115; border-color:#5eead4; font-weight:600; }}
+a.home {{ color:#5eead4; text-decoration:none; font-size:12px; }}
+code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
+</style></head><body><div class="container">
+<a class="home" href="/">← new scan</a>
+<h1>📁 Previous scans <span style="color:#8b93a3;font-weight:normal;font-size:13px">— /tmp/jspect-web/</span></h1>
+<table><thead><tr><th>Target</th><th>When</th><th>Size</th><th>Actions</th></tr></thead>
+<tbody>{''.join(rows)}</tbody></table>
+</div></body></html>""")
+                return
+
+            # ── /scans/<dirname>/files[...] and /scans/<dirname>/report ──────
+            # Browse / serve from a scan directory on disk (no in-memory job needed).
+            if self.path.startswith("/scans/"):
+                parts = self.path.split("/", 3)   # ['', 'scans', '<dir>', 'files...' or 'report']
+                if len(parts) < 4:
+                    self._send_html("<h1>404</h1>", 404); return
+                dir_name = parts[2]
+                rest = parts[3]
+                base = (Path("/tmp/jspect-web") / dir_name).resolve()
+                try:
+                    base.relative_to(Path("/tmp/jspect-web").resolve())
+                except ValueError:
+                    self._send_html("403", 403); return
+                if not base.is_dir():
+                    self._send_html("404", 404); return
+
+                if rest == "report" or rest == "report/":
+                    rpt = base / "report.html"
+                    if not rpt.exists():
+                        self._send_html("<h1>no report</h1>", 404); return
+                    data = rpt.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+
+                if rest.startswith("files"):
+                    tail = rest[len("files"):].lstrip("/")
+                    p = (base / tail).resolve()
+                    try: p.relative_to(base)
+                    except ValueError: self._send_html("403", 403); return
+                    if p.is_dir():
+                        self._send_html(_web_render_dir_listing(
+                            p, base,
+                            url_prefix=f"/scans/{dir_name}/files",
+                            back_link=("/scans", "← previous scans"),
+                        ))
+                        return
+                    if p.is_file():
+                        self.send_response(200)
+                        ctype = _web_guess_content_type(p.suffix)
+                        self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+                        self.send_header("Content-Length", str(p.stat().st_size))
+                        self.end_headers()
+                        self.wfile.write(p.read_bytes())
+                        return
+                    self._send_html("404", 404); return
+                self._send_html("404", 404); return
+
+            if self.path.startswith("/jobs/") and self.path.count("/") == 2:
+                job_id = self.path.rsplit("/", 1)[1]
+                job = _JOBS.get(job_id)
+                if not job:
+                    self._send_html("<h1>404</h1>unknown job", 404); return
+                page = _WEB_PROGRESS_HTML.replace("{job_id}", job_id) \
+                                         .replace("{target}", html_escape(job["target"]))
+                self._send_html(page)
+                return
+            if self.path.startswith("/events/"):
+                job_id = self.path.rsplit("/", 1)[1]
+                job = _JOBS.get(job_id)
+                if not job:
+                    self.send_response(404); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                q = job["log_q"]
+                while True:
+                    try:
+                        line = q.get(timeout=WEB_SSE_KEEPALIVE_S)
+                    except _queue.Empty:
+                        # Keepalive ping
+                        try: self.wfile.write(b": ping\n\n"); self.wfile.flush()
+                        except Exception: return
+                        continue
+                    try:
+                        self.wfile.write(f"data: {line}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except Exception:
+                        return
+                    if line in ("__DONE__", "__CRASHED__"):
+                        return
+            if self.path.startswith("/jobs/") and "/report" in self.path:
+                job_id = self.path.split("/")[2]
+                job = _JOBS.get(job_id)
+                if not job: self._send_html("404", 404); return
+                report = Path(job["output_dir"]) / "report.html"
+                if not report.exists():
+                    self._send_html("<h1>report not ready</h1>", 404); return
+                data = report.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if self.path.startswith("/jobs/") and "/files" in self.path:
+                # Simple directory listing — shares logic with /scans/<dir>/files
+                job_id = self.path.split("/")[2]
+                job = _JOBS.get(job_id)
+                if not job: self._send_html("404", 404); return
+                # Resolve `out` ONCE so all subsequent path math is symlink-safe.
+                # macOS /tmp → /private/tmp would otherwise break relative_to().
+                out = Path(job["output_dir"]).resolve()
+                tail = self.path.split("/files", 1)[1].lstrip("/")
+                p = (out / tail).resolve()
+                try: p.relative_to(out)
+                except ValueError: self._send_html("403", 403); return
+                if p.is_dir():
+                    self._send_html(_web_render_dir_listing(
+                        p, out,
+                        url_prefix=f"/jobs/{job_id}/files",
+                        back_link=(f"/jobs/{job_id}", "← back to job"),
+                    ))
+                    return
+                if p.is_file():
+                    self.send_response(200)
+                    ctype = _web_guess_content_type(p.suffix)
+                    self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+                    self.send_header("Content-Length", str(p.stat().st_size))
+                    self.end_headers()
+                    self.wfile.write(p.read_bytes())
+                    return
+                self._send_html("404", 404); return
+            self._send_html("404", 404)
+
+        def do_POST(self) -> None:
+            # POST /jobs/<id>/cancel — kill a running scan
+            if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):
+                job_id = self.path.split("/")[2]
+                job = _JOBS.get(job_id)
+                if not job:
+                    self._send_html("404", 404); return
+                proc = job.get("process")
+                if proc is None:
+                    self._send_html("scan not yet running", 409); return
+                if proc.poll() is not None:
+                    self._send_html("scan already finished", 409); return
+                try:
+                    proc.terminate()           # SIGTERM first — give it a moment to clean up
+                    try:
+                        proc.wait(timeout=WEB_CANCEL_GRACE_S)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()            # then SIGKILL
+                    job["status"] = "cancelled"
+                    job["log_q"].put("\n[!] scan cancelled by user")
+                    job["log_q"].put("__CRASHED__")    # reuse the CRASHED stream marker
+                except Exception as exc:
+                    self._send_html(f"<h1>cancel failed</h1><p>{html_escape(str(exc))}</p>", 500)
+                    return
+                # 204 No Content — the page polls SSE for the __CRASHED__ event
+                self.send_response(204); self.end_headers()
+                return
+            if self.path != "/scan":
+                self._send_html("404", 404); return
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8")
+            form = _up.parse_qs(raw, keep_blank_values=True)
+
+            # Burp request takes priority — if the user pasted one, parse it
+            # into target + headers and ignore the URL/headers fields.
+            burp_raw = (form.get("burp_request", [""])[0] or "").strip()
+            target = (form.get("target", [""])[0] or "").strip()
+            headers = [h.strip() for h in (form.get("headers", [""])[0] or "").splitlines() if h.strip()]
+
+            if burp_raw:
+                try:
+                    parsed = _parse_raw_http_request(burp_raw)
+                    target = parsed["url"]
+                    # Merge any manually-typed headers in case the user wanted both
+                    headers = parsed["headers"] + headers
+                except ValueError as exc:
+                    self._send_html(
+                        f"<h1>Couldn't parse Burp request</h1>"
+                        f"<p style='font-family:monospace'>{html_escape(str(exc))}</p>"
+                        f"<p><a href='/'>← back</a></p>", 400)
+                    return
+
+            if not target:
+                self._send_html(
+                    "<h1>Missing target</h1>"
+                    "<p>Either fill in the <strong>Target URL</strong> field "
+                    "OR paste a raw HTTP request in the <strong>Paste Burp request</strong> tab.</p>"
+                    "<p><a href='/'>← back</a></p>", 400)
+                return
+
+            args_dict = {
+                "url":    target if not target.startswith("/") else "",
+                "dir":    target if target.startswith("/") else "",
+                "header": headers,
+                "profile": (form.get("profile", ["default"])[0] or "default"),
+                "proxy":   (form.get("proxy", [""])[0] or "").strip() or None,
+                "proxy_insecure": True if (form.get("proxy", [""])[0] or "").startswith("http://127.0.0.1") else False,
+                "ajax_fill_forms": (form.get("ajax_fill_forms", ["off"])[0] or "off"),
+            }
+            # Output dir
+            custom_out = (form.get("output", [""])[0] or "").strip()
+            host = re.sub(r"^https?://", "", target).split("/")[0] or "scan"
+            host = re.sub(r"[^a-zA-Z0-9.-]+", "-", host)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output_dir = Path(custom_out) if custom_out else \
+                         Path("/tmp/jspect-web") / f"jspect-{host}-{ts}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Register the job + spawn the subprocess
+            import secrets as _secrets
+            job_id = _secrets.token_urlsafe(WEB_JOB_ID_BYTES)
+            with _JOB_LOCK:
+                _JOBS[job_id] = {
+                    "log_q": _queue.Queue(maxsize=WEB_LOG_QUEUE_MAX),
+                    "output_dir": output_dir,
+                    "target": target,
+                    "status": "running",
+                    "process": None,
+                }
+            _threading.Thread(target=_spawn_scan_subprocess,
+                              args=(args_dict, job_id, output_dir),
+                              daemon=True).start()
+            self._send_redirect(f"/jobs/{job_id}")
+
+    httpd = _hs.ThreadingHTTPServer((bind, port), Handler)
+    url = f"http://{bind}:{port}"
+    print(BANNER)
+    print(f"  {C.BOLD}{C.CYAN}Web wizard ready{C.RESET}")
+    print(f"  {C.GREEN}→{C.RESET} {C.BOLD}{url}{C.RESET}")
+    if bind == "127.0.0.1":
+        print(f"  {C.DIM}localhost only — use --bind 0.0.0.0 to expose externally{C.RESET}")
+    print(f"  {C.DIM}Ctrl+C to stop{C.RESET}\n")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\n  {C.YELLOW}shutting down{C.RESET}")
+        httpd.shutdown()
+
+
 class HelpfulArgumentParser(argparse.ArgumentParser):
     """Print full help on any argparse error (missing arg, bad value, etc.)."""
 
@@ -5514,106 +7231,175 @@ def main():
 
     parser = HelpfulArgumentParser(
         prog="jspect",
-        description="Automated JS analysis pipeline (Katana → JSluice → Semgrep → TruffleHog)",
+        description=(
+            "Automated JavaScript security analysis pipeline.\n"
+            "Pick a profile (--profile) for a one-shot scan, or run interactively "
+            "with -i (terminal) / --serve (web UI)."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # URL mode — crawl and analyse a live target:\n"
-            "  ./jspect.py -u https://target.com\n"
-            "  ./jspect.py -u https://target.com -H \"Cookie: session=abc123\"\n"
-            "  ./jspect.py -u https://target.com -H \"Authorization: Bearer eyJ...\" -d 6\n"
-            "  ./jspect.py -u https://target.com --verify-secrets    # ROE permitting\n"
-            "  ./jspect.py -u https://target.com --no-beautify       # skip prettifier\n"
-            "  ./jspect.py -u https://target.com --discover-levels 0 # disable nested JS\n"
-            "\n"
-            "  # Dir mode — analyse a local source tree directly:\n"
-            "  ./jspect.py --dir /path/to/NodeGoat\n"
-            "\n"
-            "  # Combined — static source analysis + live endpoint probing:\n"
-            "  ./jspect.py --dir /path/to/NodeGoat -u http://localhost:4000\n"
-            "  ./jspect.py --dir /path/to/NodeGoat -u http://localhost:4000 \\\n"
-            "      -H \"Cookie: connect.sid=s%3Axxx...\"\n"
+            "  jspect -u https://target.com                            # default profile, AJAX spider on\n"
+            "  jspect -u https://target.com --profile gentle           # 1-thread, polite\n"
+            "  jspect -u https://target.com --profile full             # everything safe\n"
+            "  jspect -u https://target.com -H \"Cookie: session=abc\"   # authenticated\n"
+            "  jspect -u https://target.com --proxy http://127.0.0.1:8080  # route through Burp\n"
+            "  jspect --dir /path/to/source                            # local code review (no network)\n"
+            "  jspect -i                                               # terminal wizard\n"
+            "  jspect --serve                                          # web wizard at http://127.0.0.1:8765\n"
+            "  jspect --help-advanced                                  # show all expert flags\n"
         ),
     )
-    parser.add_argument("-u", "--url", default=None,
-                        help="Target URL to crawl (required unless --dir is used)")
-    parser.add_argument("--dir", default=None, metavar="PATH",
-                        help="Analyze a local JS source directory directly (skips crawl/download). "
-                             "Use with -u to set the report target label, e.g. "
-                             "--dir /path/to/app -u http://localhost:4000")
-    parser.add_argument("-H", "--header", action="append", default=[], metavar="HEADER",
-                        help="Header for auth, e.g. \"Cookie: session=abc\" or \"Authorization: Bearer xxx\". Repeatable.")
-    parser.add_argument("-o", "--output", default=None, metavar="DIR",
+
+    # ── Common (shown in default --help) ─────────────────────────────────────
+    common = parser.add_argument_group("Common")
+    common.add_argument("-u", "--url", default=None, metavar="URL",
+                        help="Target URL to scan")
+    common.add_argument("--dir", default=None, metavar="PATH",
+                        help="Local JS source directory (skips crawl/download)")
+    common.add_argument("-H", "--header", action="append", default=[], metavar="HEADER",
+                        help='Auth header — e.g. "Cookie: session=abc" or "Authorization: Bearer xxx". '
+                             "Repeatable.")
+    common.add_argument("--from-burp", default=None, metavar="FILE",
+                        help="Read a raw HTTP request from FILE (or '-' for stdin) and "
+                             "auto-extract target URL + cookies + auth headers. "
+                             "Paste a Burp 'Copy request' clipboard, curl -v dump, or "
+                             "mitmproxy export.")
+    common.add_argument("-o", "--output", default=None, metavar="DIR",
                         help="Output directory (default: auto-timestamped)")
-    parser.add_argument("-d", "--depth", type=int, default=5, metavar="N",
-                        help="Katana crawl depth (default 5)")
-    parser.add_argument("--rate-limit", type=int, default=50, metavar="N",
-                        help="Katana rate limit per second (default 50)")
-    parser.add_argument("--max-duration", type=int, default=10, metavar="MIN",
-                        help="Katana crawl time cap in minutes (default 10)")
-    parser.add_argument("--discover-levels", type=int, default=2, metavar="N",
-                        help="Multi-level JS discovery depth (default 2, 0 to disable)")
-    parser.add_argument("--no-beautify", action="store_true",
-                        help="Skip the JS beautification stage")
-    # Headless: kept as an opt-IN flag because Katana's `-headless` mode is
-    # marked "experimental" upstream and hangs silently on macOS in our testing
-    # (Chrome itself works fine; the Katana integration is the culprit).
-    # On Linux/Docker it can still be useful for SPA-heavy targets.
-    parser.add_argument("--headless", action="store_true",
-                        help="Run Katana in headless Chrome mode (experimental upstream; "
-                             "hangs silently on macOS — recommended only on Linux/Docker)")
-    # Back-compat alias — the flag was previously --no-headless and defaulted to headless=ON.
-    # Now we default to headless=OFF since most of our test platforms can't use it.
-    parser.add_argument("--no-headless", action="store_true",
-                        help=argparse.SUPPRESS)   # deprecated, kept for back-compat
-    parser.add_argument("--verify-secrets", action="store_true",
-                        help="Run TruffleHog with --only-verified (makes real API calls — check ROE)")
-    parser.add_argument("--proxy", default=None, metavar="URL",
-                        help="HTTP/SOCKS proxy for every outbound request "
-                             "(e.g. http://127.0.0.1:8080 for Burp, socks5://127.0.0.1:9050 for Tor). "
-                             "Sets HTTP(S)_PROXY env vars and passes -proxy to Katana.")
-    parser.add_argument("--proxy-insecure", action="store_true",
-                        help="Skip TLS verification on the proxy connection "
-                             "(needed for Burp/mitmproxy with self-signed certs)")
-    parser.add_argument("--threads", type=int, default=None, metavar="N",
-                        help=f"Concurrent workers for JS download + endpoint probing "
-                             f"(default {THREAD_POOL_WORKERS}). Use 1 to be polite to small targets.")
-    parser.add_argument("--max-endpoints", type=int, default=None, metavar="N",
-                        help=f"Cap how many endpoints Stage 5 live-validates "
-                             f"(default {MAX_ENDPOINTS_TO_VALIDATE}). Use 0 for unlimited. "
-                             f"When the cap is hit, API-shaped paths are prioritized over content URLs.")
-    parser.add_argument("--no-wayback", action="store_true",
-                        help="Skip Wayback Machine historical map discovery (Stage 5d)")
-    parser.add_argument("--active-recon", action="store_true",
-                        help="Aggressive file discovery: Google dorks + broad Wayback queries "
-                             "across many file types (.js .map .json .yml .env .config .txt .bak …). "
-                             "Set GOOGLE_API_KEY + GOOGLE_CSE_ID env vars to auto-fetch dork results.")
-    parser.add_argument("-v", "--verbose", action="count", default=0,
-                        help="Increase verbosity (-v = verbose, -vv = debug)")
-    parser.add_argument("-q", "--quiet", action="store_true",
+    common.add_argument("--profile", choices=list(PROFILES), default=PROFILE_DEFAULT,
+                        metavar="MODE",
+                        help=f"Scan intensity: {' | '.join(PROFILES)}  (default: {PROFILE_DEFAULT})")
+    common.add_argument("--proxy", default=None, metavar="URL",
+                        help="Route everything through a proxy (Burp / mitmproxy / Tor SOCKS)")
+    common.add_argument("-v", "--verbose", action="count", default=0,
+                        help="Increase verbosity (-v / -vv)")
+    common.add_argument("-q", "--quiet", action="store_true",
                         help="Suppress non-essential output")
 
-    # Show full help when run with no arguments at all
+    # ── Modes (alternative entry points) ──────────────────────────────────────
+    modes = parser.add_argument_group("Modes")
+    modes.add_argument("-i", "--interactive", action="store_true",
+                       help="Launch terminal wizard (asks for target / profile / auth interactively)")
+    modes.add_argument("--serve", action="store_true",
+                       help="Launch web wizard at http://BIND:PORT (defaults below)")
+    modes.add_argument("--port", type=int, default=8765, metavar="N",
+                       help="Web wizard port (default 8765)")
+    modes.add_argument("--bind", default="127.0.0.1", metavar="ADDR",
+                       help="Web wizard bind address (default 127.0.0.1 — localhost only)")
+    modes.add_argument("--help-advanced", action="store_true",
+                       help="Show all advanced / profile-override flags and exit")
+
+    # ── Advanced (override profile values — hidden from default help) ─────────
+    # We add these to a group named "Advanced" so they appear if the user asks
+    # for --help-advanced (we re-print help with this group made visible).
+    advanced = parser.add_argument_group("Advanced")
+    advanced.add_argument("-d", "--depth", type=int, default=None, metavar="N",
+                          help="Katana crawl depth")
+    advanced.add_argument("--rate-limit", type=int, default=None, metavar="N",
+                          help="Katana requests/sec")
+    advanced.add_argument("--max-duration", type=int, default=None, metavar="MIN",
+                          help="Katana crawl time cap (minutes)")
+    advanced.add_argument("--discover-levels", type=int, default=None, metavar="N",
+                          help="Stage 2b nested-JS discovery depth (0 = off)")
+    advanced.add_argument("--threads", type=int, default=None, metavar="N",
+                          help="Parallel workers for download + live-probe")
+    advanced.add_argument("--max-endpoints", type=int, default=None, metavar="N",
+                          help="Cap Stage 5 live-validation (0 = unlimited)")
+    advanced.add_argument("--ajax-spider", action=argparse.BooleanOptionalAction,
+                          default=None,
+                          help="Enable / disable Stage 1b AJAX spider (Playwright)")
+    advanced.add_argument("--ajax-max-pages", type=int, default=None, metavar="N",
+                          help="AJAX spider: pages beyond seed")
+    advanced.add_argument("--ajax-max-clicks", type=int, default=None, metavar="N",
+                          help="AJAX spider: clicks per page per pass")
+    advanced.add_argument("--ajax-depth", type=int, default=None, metavar="N",
+                          help="AJAX spider: BFS pass count per page")
+    advanced.add_argument("--ajax-fill-forms", choices=AJAX_FILL_MODES,
+                          default=None, metavar="MODE",
+                          help="AJAX spider: off / safe / all (form submission risk)")
+    advanced.add_argument("--active-recon", action=argparse.BooleanOptionalAction,
+                          default=None,
+                          help="Enable / disable Stage 4b (Google dorks + broad Wayback)")
+    # default=None so apply_profile() can detect "user didn't pass it" and
+    # apply the profile's value; main() treats None as falsy (no Wayback skip).
+    advanced.add_argument("--no-wayback", action="store_true", default=None,
+                          help="Skip Stage 5d Wayback historical maps")
+    advanced.add_argument("--no-beautify", action="store_true", default=False,
+                          help="Skip Stage 2c JS beautifier")
+    advanced.add_argument("--headless", action="store_true", default=False,
+                          help="Katana headless Chrome (experimental upstream)")
+    advanced.add_argument("--verify-secrets", action="store_true", default=False,
+                          help="TruffleHog --only-verified (real API calls)")
+    advanced.add_argument("--proxy-insecure", action="store_true", default=False,
+                          help="Skip TLS verification on proxy connection")
+    # Back-compat shim — old flag, hidden but still functional
+    advanced.add_argument("--no-headless", action="store_true",
+                          help=argparse.SUPPRESS)
+
+    # If invoked with no args at all, drop into the terminal wizard (assuming a tty).
+    # Falls through to print-help when not on a tty so CI / scripts get a clear message.
     if len(sys.argv) == 1:
-        parser.print_help()
-        sys.exit(0)
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            sys.argv.append("--interactive")
+        else:
+            parser.print_help()
+            sys.exit(0)
 
     args = parser.parse_args()
 
-    # Validate: need at least --url or --dir
-    if not args.url and not args.dir:
-        parser.error("one of --url or --dir is required")
+    # --help-advanced: re-print help with every group visible (no-op for now —
+    # all groups are shown by default in argparse; this hook is reserved for
+    # filtering Advanced out of the default view if we add a custom formatter).
+    if getattr(args, "help_advanced", False):
+        parser.print_help()
+        sys.exit(0)
 
-    # Optional concurrency override — let callers throttle to be polite to small targets.
+    # Apply profile defaults to any flag the user didn't explicitly set.
+    apply_profile(args, args.profile)
+
+    # --from-burp: read a raw HTTP request, parse it, and override target/headers.
+    if args.from_burp:
+        try:
+            if args.from_burp == "-":
+                raw_req = sys.stdin.read()
+            else:
+                raw_req = Path(args.from_burp).read_text(encoding="utf-8", errors="replace")
+            parsed = _parse_raw_http_request(raw_req)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--from-burp: could not parse request: {exc}")
+        # Burp-parsed values take priority. Any -H the user also passed gets
+        # appended (in case they want to add a header that wasn't in the request).
+        args.url = parsed["url"]
+        args.header = parsed["headers"] + (args.header or [])
+        Log.info(f"    {C.DIM}↳ --from-burp: target={parsed['url']}  "
+                 f"({len(parsed['headers'])} header(s) extracted){C.RESET}")
+
+    # ── Alternative-mode dispatchers ─────────────────────────────────────────
+    # --serve takes priority over --interactive. Both can run without -u/--dir
+    # at startup — they'll prompt / collect the target themselves.
+    if args.serve:
+        run_web_wizard(args)
+        return
+    if args.interactive:
+        interactive_setup(args)        # mutates `args` in place with answers
+        # fall through to the normal pipeline below
+
+    # Validate: by now we MUST have a target (CLI flag, interactive answer, or web form).
+
+    if not args.url and not args.dir:
+        parser.error("a target is required (-u URL or --dir PATH); "
+                     "or use -i / --serve for interactive setup")
+
+    # Apply the (now profile-resolved) threads + max-endpoints values to the
+    # module-level globals that other stages read.
     if args.threads is not None:
         if args.threads < 1:
             parser.error("--threads must be >= 1")
         THREAD_POOL_WORKERS = args.threads
-    # Optional endpoint-validation cap override.
     if args.max_endpoints is not None:
         if args.max_endpoints < 0:
             parser.error("--max-endpoints must be >= 0 (0 = unlimited)")
-        # 0 → effectively infinite (large enough to never hit)
         MAX_ENDPOINTS_TO_VALIDATE = args.max_endpoints if args.max_endpoints > 0 else 10**9
 
     # Optional proxy: set env vars so urllib (Python stages) and child processes
@@ -5733,15 +7519,31 @@ def main():
             url_count = 0
         results["url_count"] = url_count
 
-        # Stage 2 — always try download_js, even when Katana yielded nothing.
-        # download_js has a built-in homepage fallback (reads katana-target.txt)
-        # that lets us still discover scripts via direct fetch of the seed URL.
+        # Ensure katana-out.txt exists before Stage 1b / 2 — both stages read from it.
         if not katana_out:
-            # Synthesize an empty katana-out.txt so download_js can run its
-            # HTML scrape / homepage-fetch fallbacks.
             katana_out = output_dir / "katana-out.txt"
             if not katana_out.exists():
                 katana_out.write_text("", encoding="utf-8")
+
+        # Stage 1b — AJAX spider (opt-in). Appends discovered URLs to katana-out.txt
+        # so Stage 2's download_js picks them up transparently.
+        if args.ajax_spider:
+            spider_file = ajax_spider(
+                args.url, output_dir, args.header, katana_out=katana_out,
+                max_pages=args.ajax_max_pages, max_clicks=args.ajax_max_clicks,
+                depth=args.ajax_depth,
+                fill_forms_mode=args.ajax_fill_forms,
+                proxy=args.proxy, proxy_insecure=args.proxy_insecure,
+            )
+            results["ajax_spider_file"] = spider_file
+            if spider_file:
+                results["ajax_spider_count"] = count_nonempty_lines(spider_file)
+            # Refresh URL count since katana-out may have grown
+            results["url_count"] = count_nonempty_lines(katana_out)
+
+        # Stage 2 — always try download_js, even when Katana yielded nothing.
+        # download_js has a built-in homepage fallback (reads katana-target.txt)
+        # that lets us still discover scripts via direct fetch of the seed URL.
         js_clean = download_js(katana_out, output_dir, args.header)
         if not js_clean:
             # No JS downloaded directly — fall back to an empty js-clean dir so

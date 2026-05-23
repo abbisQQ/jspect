@@ -1,367 +1,175 @@
-# jspect — JavaScript Analysis Pipeline
+# jspect
 
-Automated multi-stage static analysis tool for web application penetration testing. Crawls a live target or reads local source files, extracts every JavaScript asset, and runs a full analysis chain: endpoint discovery, secret detection, SAST, and vulnerable library detection — all rolled into a single dark-themed HTML report.
+Automated JavaScript security analysis pipeline. Crawls a target, pulls every JS asset, runs the standard tool chain (Katana → JSluice → Semgrep → Retire.js → TruffleHog) plus a few extras (source-map blind-probe, Wayback, well-known files, AJAX spider), and produces a single self-contained HTML report.
 
 ---
 
-## Quick Start
+## Three ways to run it
 
 ```bash
-# Analyse a live target — default settings (10 threads)
-python3 jspect.py -u http://localhost:3000
+# 1. CLI — one command
+jspect -u https://target.com
 
-# Polite single-thread run against a small target
-python3 jspect.py -u https://target.com \
-    --threads 1 --rate-limit 5 --max-duration 2
+# 2. Terminal wizard — guided prompts
+jspect -i
 
-# Full recon — Google dorks + broad Wayback + well-known files
-python3 jspect.py -u https://target.com \
-    --active-recon --max-endpoints 1500
-
-# Authenticated scan
-python3 jspect.py -u https://target.com \
-    -H "Cookie: session=..." \
-    -H "Authorization: Bearer eyJ..."
-
-# Analyse local source code (e.g. NodeGoat) — no network at all
-python3 jspect.py --dir /path/to/NodeGoat
-
-# Both: full static analysis + live endpoint probing, authenticated
-python3 jspect.py \
-    --dir /path/to/NodeGoat \
-    -u http://localhost:4000 \
-    -H "Cookie: connect.sid=s%3Axxx..."
+# 3. Web wizard — browser UI on localhost
+jspect --serve
 ```
 
-The report is written to a timestamped directory in the current folder:
-```
-jspect-target-com-20260518-103803/report.html
-```
+The web wizard also accepts a **raw Burp request** (paste from Burp's "Copy request" clipboard) and auto-extracts URL + cookies + auth headers.
 
 ---
 
-## Dependencies
+## Install
 
-Install all tools before running. The script checks for each at startup and skips stages for missing tools (it will not crash).
+### Docker (recommended — bundles every dependency)
 
-| Tool | Install | Used for |
-|------|---------|----------|
-| **Katana** | `go install github.com/projectdiscovery/katana/cmd/katana@latest` | Crawling |
-| **JSluice** | `go install github.com/BishopFox/jsluice/cmd/jsluice@latest` | Endpoint/secret extraction |
-| **Semgrep** | `pip install semgrep` | SAST / DOM sink detection |
-| **Retire.js** | `npm install -g retire` | Vulnerable library fingerprinting |
-| **TruffleHog** | `brew install trufflehog` | Secret/credential detection |
-| **jsbeautifier** | `pip install jsbeautifier` | Minified JS expansion |
-| **sourcemapper** | `go install github.com/denandz/sourcemapper@latest` | Webpack source map unpacking |
-| **unwebpack-sourcemap** | `npm install -g unwebpack-sourcemap` | Source map recovery (fallback) |
+```bash
+git clone https://github.com/abbisQQ/jspect
+cd jspect
+docker build -t jspect .
 
-> **Go tools** require `$GOPATH/bin` (usually `~/go/bin`) to be in your `PATH`. Add this to your shell profile:
-> ```bash
-> export PATH="$HOME/go/bin:$PATH"
-> ```
+# Then any of:
+docker run --rm -v $(pwd)/out:/output jspect -u https://target.com
+docker run --rm -it -v $(pwd)/out:/output jspect -i
+docker run --rm -p 8765:8765 -v $(pwd)/out:/output jspect --serve --bind 0.0.0.0
+```
 
-The Python deps are installable in one shot:
+### Native (macOS / Linux)
+
 ```bash
 pip install -r requirements.txt
+# External binaries (one-time):
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/BishopFox/jsluice/cmd/jsluice@latest
+go install github.com/denandz/sourcemapper@latest
+npm install -g retire
+brew install trufflehog                                  # or: see install.sh on trufflehog repo
+playwright install chromium                              # only for --ajax-spider
 ```
 
-### Optional: better source-map recovery via `mapperplus`
+Run with `python3 jspect.py -u https://target.com`.
 
-For deeply-bundled webpack apps where the built-in extractor and `unwebpack-sourcemap` come up short, you can drop the [`mapperplus`](https://github.com/Zierax/MapperPlus) helper next to the script:
+---
+
+## Profiles
+
+Pick the intensity. Most flags below are bundled into these:
+
+| Profile | Threads | Cap | AJAX spider | Active recon | Wayback | When |
+|---------|--------:|----:|:-----------:|:------------:|:-------:|------|
+| `fast` | 10 | 200 | off | off | off | Triage — ~30s |
+| `default` ★ | 10 | 500 | **on** | off | on | Most engagements |
+| `full` | 10 | ∞ | on | on | on | Maximum coverage (~10-30 min) |
+| `gentle` | 1 | 200 | off | off | off | Polite to small / fragile targets |
 
 ```bash
-git clone https://github.com/Zierax/MapperPlus.git ./mapperplus
+jspect -u https://target.com --profile gentle
 ```
 
-The tool auto-detects `./mapperplus/mapperplus.py` and prefers it. If it's missing, the tool falls back gracefully — nothing breaks.
+---
 
-### Optional: auto-fetch Google dork results (`--active-recon`)
+## Common flags
 
-Set two env vars to enable automatic fetching of Google dork results via the
-Custom Search JSON API (free tier: 100 queries/day):
+```
+-u URL                 Target URL
+--dir PATH             Local source directory (skips crawl)
+-H "Cookie: ..."       Auth header (repeatable)
+--from-burp FILE       Read raw HTTP request from file (or '-' for stdin)
+-o DIR                 Output directory (default: auto-timestamped)
+--profile MODE         fast / default / full / gentle
+--proxy URL            Route everything through Burp / mitmproxy / Tor
+-i                     Terminal wizard
+--serve [--port N]     Web wizard (default port 8765)
+--help-advanced        Show ~15 more advanced flags
+```
+
+### Authenticated scan (any of these works)
 
 ```bash
-export GOOGLE_API_KEY="..."
-export GOOGLE_CSE_ID="..."
+jspect -u https://app.example.com -H "Cookie: session=..." -H "Authorization: Bearer eyJ..."
+jspect --from-burp /path/to/burp-request.txt
+pbpaste | jspect --from-burp -                   # macOS — pipe a Burp clipboard
 ```
 
-When unset, `--active-recon` still generates and saves the clickable dork URLs to `dorks.json` for manual use.
-
----
-
-## Operating Modes
-
-### URL Mode — Live Target
-
-Crawls the target with a headless browser (Katana), downloads all JavaScript responses, then analyses them.
+### Pipe everything through Burp
 
 ```bash
-python3 jspect.py -u https://target.com
+jspect -u https://target.com --proxy http://127.0.0.1:8080 --proxy-insecure
 ```
 
-**Use this when:** You only have access to the running application (black-box test).
+Every request — Katana crawl, JS downloads, live-validation probes, well-known, Wayback, AJAX spider, blind source-map probes — appears in Burp's sitemap.
 
 ---
 
-### Dir Mode — Local Source Tree
+## What the report shows
 
-Skips crawl and download entirely. Copies every `*.js` file found under the given directory (excluding `node_modules`) into the analysis corpus, then runs all analysis stages.
+The HTML report opens with a **Critical Findings** TL;DR (CVEs, exposed maps, ERROR-severity SAST, leaks, dangling JS, etc.) and links straight to each row. Below that:
+
+| Section | Content |
+|---------|---------|
+| Endpoints | Every URL the JS code calls (jsluice AST extraction) |
+| AJAX Spider | URLs only discovered after JS hydration / clicks (when `--ajax-spider`) |
+| Live Endpoints | HTTP probe results — status, type, size, title |
+| HTTP Calls | `fetch` / `axios` / `XHR` / Express routes from source |
+| Source Maps | Exposed `.map` files (extracts the original source tree) |
+| Libraries | Retire.js findings — vulnerable lib versions + CVEs |
+| Semgrep | DOM-XSS / `eval` / open-redirect / cookie misconfig |
+| Secrets | JWT / AWS / API key patterns + TruffleHog candidates |
+| Well-known | `robots.txt` / `sitemap.xml` / `.well-known/*` / `.git/*` / `.env*` / etc. |
+| Comments | TODO / FIXME / credential mentions in JS source |
+
+Empty sections collapse to a single "no findings" line — the report stays scannable even on clean targets.
+
+---
+
+## The web wizard
+
+`jspect --serve` boots a localhost-only HTTP server (default `127.0.0.1:8765`). Three pages:
+
+| URL | Page |
+|-----|------|
+| `/` | Form — start a new scan (URL tab + Burp-request tab + advanced options) |
+| `/jobs/<id>` | Live progress — stage-by-stage SSE stream + Stop / Browse / Report buttons |
+| `/scans` | Past-scan history — every scan dir on disk, regardless of server lifetime |
+
+Submits a scan as a subprocess; **Stop scan** sends SIGTERM (3s grace) → SIGKILL. Partial output is preserved.
+
+To expose externally (use a VPN — there's no auth):
 
 ```bash
-python3 jspect.py --dir /path/to/source
-```
-
-**Use this when:** You have the source code (code review, open-source audit, cloned repo).
-
-> Express/Node.js routes, data-layer files, config files, and server-side logic are all included — nothing is excluded because it "doesn't run in a browser."
-
----
-
-### Combined Mode — Best of Both
-
-Provides the full source analysis of `--dir` plus live endpoint probing against the running application. Pass both flags together.
-
-```bash
-python3 jspect.py \
-    --dir /path/to/NodeGoat \
-    -u http://localhost:4000
-```
-
-The `-u` value is used as:
-1. The base URL for live endpoint probing (Stage 5)
-2. The report title / target label
-
----
-
-## Authentication
-
-Pass session cookies or auth headers with `-H`. The flag is repeatable.
-
-```bash
-# Session cookie (most common for web apps)
-python3 jspect.py -u http://localhost:4000 \
-    -H "Cookie: connect.sid=s%3Axxx..."
-
-# Bearer token
-python3 jspect.py -u https://api.example.com \
-    -H "Authorization: Bearer eyJhbGciOiJSUzI1NiJ9..."
-
-# Multiple headers
-python3 jspect.py -u https://target.com \
-    -H "Cookie: session=abc" \
-    -H "X-CSRF-Token: xyz"
-```
-
-### Getting the session cookie
-
-```bash
-# Login and capture the cookie
-curl -c /tmp/cookies.txt -X POST http://localhost:4000/login \
-    -d "userName=tester&password=tester" \
-    -H "Content-Type: application/x-www-form-urlencoded" -L -o /dev/null
-
-# Verify it works on a protected route
-curl -b /tmp/cookies.txt http://localhost:4000/dashboard -o /dev/null -w "%{http_code}\n"
-
-# Use it with the tool
-COOKIE=$(grep connect.sid /tmp/cookies.txt | awk '{print $6"="$7}')
-python3 jspect.py -u http://localhost:4000 -H "Cookie: $COOKIE"
+jspect --serve --bind 0.0.0.0 --port 8765
 ```
 
 ---
 
-## Proxy
-
-`--proxy URL` routes **every outbound request** the tool makes through the given proxy — Katana's crawl, JS downloads, live-endpoint validation, well-known probes, Wayback CDX queries, active-recon Google CSE calls, blind source-map probes. Useful for Burp Suite, mitmproxy, ZAP, or Tor.
-
-```bash
-# Burp Suite (default proxy port)
-python3 jspect.py -u https://target.com \
-    --proxy http://127.0.0.1:8080 \
-    --proxy-insecure                       # Burp uses a self-signed CA
-
-# mitmproxy
-python3 jspect.py -u https://target.com --proxy http://127.0.0.1:8080 --proxy-insecure
-
-# Tor SOCKS
-python3 jspect.py -u https://target.com --proxy socks5://127.0.0.1:9050
-
-# Inside Docker — point at the host's proxy
-docker run --rm -v $(pwd)/out:/output jspect:latest \
-    -u https://target.com \
-    --proxy http://host.docker.internal:8080 \
-    --proxy-insecure
-```
-
-### How it's wired
-
-| Component | Routing |
-|---|---|
-| Python `fetch_url()` (live-validate, well-known, Wayback CDX, blind-probe, recon) | Via `HTTP_PROXY`/`HTTPS_PROXY` env vars (urllib auto-detects) |
-| Katana (Stage 1 crawl) | Via `-proxy <url>` flag passed directly to Katana |
-| Subprocess tools (Semgrep, Retire.js, TruffleHog, JSluice) | They operate on local files only — no outbound traffic; proxy doesn't apply |
-
-`--proxy-insecure` also disables Python TLS verification when talking to the proxy (sets `PYTHONHTTPSVERIFY=0`, clears CA bundles). The target-side TLS context was already permissive (accepts self-signed leaf certs) — that's unrelated.
-
----
-
-## Pipeline Stages
-
-| Stage | Name | Description |
-|-------|------|-------------|
-| 1 | Katana crawl | Crawls the target; discovers page + JS URLs. URL mode only. |
-| 2 | JS download | Fetches and deduplicates all JS files into a local corpus. URL mode only. **Falls back to scraping `<script src>` from HTML pages** when Katana finds few/no JS URLs (covers WordPress, DLE, FusionCMS, CodeIgniter, etc.). Final fallback: fetch the seed URL homepage directly. |
-| 2b | Nested JS discovery | Follows JS-referenced imports up to `--discover-levels` deep. URL mode only. |
-| 2c | Beautification | Expands minified JS for readability using jsbeautifier. |
-| 3 | Source-map recovery | Unpacks webpack `.map` files to reveal original source. URL mode only. |
-| 4 | JSluice | AST-based endpoint and secret extraction. Webpack module-import noise (`./auth/index.js`, etc.) is filtered out before endpoints land in `endpoints.json`. |
-| 4b | Active recon | Generates Google dorks (saved to `dorks.json`; auto-fetched via Google CSE API if `GOOGLE_API_KEY`+`GOOGLE_CSE_ID` env vars are set) and runs a broad Wayback CDX sweep across ~20 file extensions. URL mode + `--active-recon` only. |
-| 4c | Well-known files | Probes 43 conventional paths (robots.txt, sitemap.xml, .well-known/*, crossdomain.xml, .git/config, .env, package.json, Gemfile, swagger.json, etc.). Parses robots/sitemap chains recursively. Validates leak findings with per-path content-shape checks so SPA catch-all 200s aren't reported as fake leaks. |
-| 5 | Live endpoint validation | HTTP probes all discovered endpoints; records status codes, auth requirements. Capped by `--max-endpoints N` (default 500); priority order: API/auth paths first, short paths next, deep content last. |
-| 5b | Static metadata | Checks for exposed `.map` files (with **blind-probe** for maps that have no `sourceMappingURL` comment), API docs, Swagger specs, developer comments. Extracts `sourcesContent` from any map found, with safe filename truncation. |
-| 5c | HTTP calls + secrets | Regex scan for fetch/axios/XHR/Express routes; JWT, AWS, API key patterns, with Shannon-entropy gating on hex/UUID candidates. |
-| 5d | Wayback maps | Queries Wayback Machine CDX API for historically captured `*.js.map` files. Highlights maps that exist only in the archive (previously exposed, now removed). Skip with `--no-wayback`. |
-| 6 | Semgrep SAST | DOM XSS sinks, `eval()` (true global eval, not `obj.eval()` method calls), open redirects, Angular `innerHTML`, cookie misconfig. Bundles ~80 local rules. |
-| 7 | Retire.js | Fingerprints JavaScript libraries and flags known CVEs. |
-| 8 | TruffleHog | Entropy-based secret and credential detection. |
-| 9 | HTML report | Dark-themed, collapsible, self-contained single-file report. Cross-references live-probe status when ranking open-redirect candidates. |
-
----
-
-## All Options
+## Pipeline stages (FYI)
 
 ```
-python3 jspect.py --help
+1.  Katana crawl                 (URL mode)
+1b. AJAX spider                  (Playwright, opt-in via profile)
+2.  JS download                  + HTML <script src> fallback
+2b. Multi-level discovery        chases nested JS imports
+2c. JS beautification
+3.  Source-map recovery          (extract bundled source)
+4.  JSluice                      AST-based URL / secret extraction
+4b. Active recon                 Google dorks + broad Wayback CDX
+4c. Well-known probe             43 paths, leak content-shape validator
+5.  Live endpoint validation     HTTP probe + status classification
+5b. Static metadata              source-maps, JSON, comments
+5c. HTTP-call + extended secrets regex sweep on JS corpus
+5d. Wayback historical maps      CDX API for *.js.map
+6.  Semgrep SAST                 ~80 local rules
+7.  Retire.js                    known-CVE library fingerprinting
+8.  TruffleHog                   high-entropy secret detection
+9.  HTML report                  collapsible, single-file, dark theme
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-u URL` | — | Target URL (required unless `--dir` is used) |
-| `--dir PATH` | — | Local JS source directory (skips crawl/download) |
-| `-H HEADER` | — | Auth header, e.g. `"Cookie: session=abc"`. Repeatable. |
-| `-o DIR` | auto | Output directory name (default: timestamped) |
-| `-d N` | `5` | Katana crawl depth |
-| `--rate-limit N` | `50` | Katana requests/second |
-| `--max-duration MIN` | `10` | Katana crawl time cap in minutes |
-| `--discover-levels N` | `2` | Multi-level nested JS import discovery depth (0 = off) |
-| `--threads N` | `10` | Concurrent workers for JS download + endpoint probing. Use `1` to be polite to small targets. |
-| `--max-endpoints N` | `500` | Cap Stage 5 live-validation. `0` = unlimited. When the cap is hit, API/short paths are prioritized over deep content URLs. The report surfaces the truncation explicitly. |
-| `--active-recon` | off | Aggressive discovery: Google dorks (saved + optionally auto-fetched if `GOOGLE_API_KEY`+`GOOGLE_CSE_ID` env vars exist) + broad Wayback CDX queries across `.js .map .json .yml .env .config .txt .bak …`. |
-| `--no-wayback` | off | Skip Stage 5d (Wayback historical map discovery). |
-| `--no-beautify` | off | Skip JS beautification (faster, less readable output) |
-| `--headless` | off | Run Katana in headless Chrome mode (**experimental upstream — hangs silently on macOS**; recommended only on Linux/Docker). |
-| `--verify-secrets` | off | Run TruffleHog with `--only-verified` (makes real API calls — check ROE) |
-| `--proxy URL` | — | Route every outbound HTTP/HTTPS request through this proxy — Katana, JS download, live validation, well-known probe, Wayback CDX, active-recon, blind-probe. Example: `http://127.0.0.1:8080` (Burp), `socks5://127.0.0.1:9050` (Tor). See [Proxy](#proxy) below. |
-| `--proxy-insecure` | off | Skip TLS verification on the proxy connection (needed for Burp/mitmproxy with self-signed certs). |
-| `-v` / `-vv` | normal | Verbose / debug logging |
-| `-q` | off | Quiet mode — suppress non-essential output |
+Each stage is graceful — missing tools / failed crawls / empty corpora don't break downstream stages.
 
 ---
 
-## Report Sections
+## License
 
-The HTML report has a sticky navigation bar with color-coded links (orange = findings present, red = errors). Every section is collapsible.
-
-| Section | What it shows |
-|---------|---------------|
-| **Summary** | Run metadata, JS file count, tool availability |
-| **Endpoints** | All URLs extracted by JSluice from JS source |
-| **Live Endpoints** | HTTP probe results: status codes, auth-protected routes, server errors |
-| **HTTP Calls** | `fetch`, `axios`, XHR, Angular HttpClient, Express routes extracted from source |
-| **Secrets** | JSluice findings + TruffleHog candidates + extended regex matches (JWT, AWS, API keys) |
-| **Semgrep** | SAST findings grouped by severity and rule |
-| **Libraries** | Retire.js output: library versions and CVE list |
-| **Comments** | Developer comments with credential mentions and TODOs |
-| **Next Steps** | Prioritised list of suggested follow-up actions |
-
-Artifact files (JSON) for each stage are written alongside the report for use with other tools.
-
----
-
-## Recommended Test Targets
-
-These apps are intentionally vulnerable and well-suited for testing this tool:
-
-| App | Mode | Why |
-|-----|------|-----|
-| **OWASP Juice Shop** | URL | Angular SPA; tests DOM XSS, Angular `innerHTML` patterns, webpack bundles |
-| **OWASP NodeGoat** | Dir + URL | Express/Node.js; `eval(req.body)` RCE, NoSQL injection, open redirect, auth flaws |
-| **DVWA** | URL | Classic DOM XSS sinks (`innerHTML`, `eval`, `document.write`) |
-| **OWASP WebGoat** | URL | Broad OWASP Top 10 coverage including client-side |
-| **OWASP crAPI** | URL + Dir | REST API with Angular frontend; JWT abuse, BOLA |
-| **DVNA** | Dir | Node.js with Sequelize; hardcoded secrets in JS config files |
-
-### Starting NodeGoat with Docker
-
-```bash
-git clone --depth=1 https://github.com/OWASP/NodeGoat.git /tmp/NodeGoat
-cd /tmp/NodeGoat && docker compose up -d
-
-# Wait ~15s for MongoDB to initialise, then:
-python3 /path/to/jspect.py \
-    --dir /tmp/NodeGoat \
-    -u http://localhost:4000
-```
-
-### Starting Juice Shop with Docker
-
-```bash
-docker run -d --name juiceshop -p 3000:3000 bkimminich/juice-shop
-
-python3 /path/to/jspect.py -u http://localhost:3000
-```
-
----
-
-## Output Files
-
-All files are written to the output directory alongside `report.html`:
-
-| File | Contents |
-|------|----------|
-| `report.html` | Self-contained HTML report |
-| `katana-out.txt` | Raw Katana crawl output (one URL per line) |
-| `katana-target.txt` | Seed URL, used by Stage 2's homepage-fallback when crawl is empty |
-| `js-urls.txt` | JS URLs selected for download |
-| `js-clean/` | Downloaded (and beautified) JS corpus |
-| `sources/` | Source-map recovered files (if any) |
-| `url-map.json` | filename → original-URL mapping for everything in `js-clean/` |
-| `endpoints.json` | JSluice + harvested endpoint extraction (JSONL) |
-| `live-endpoints.json` | HTTP probe results (JSONL) |
-| `live-endpoints-meta.json` | Cap/truncation metadata for Stage 5 |
-| `http-calls.json` | fetch/axios/XHR/Express routes (JSONL) |
-| `secrets.json` | JSluice secret candidates (JSONL) |
-| `secrets-extended.json` | Extended regex secret matches with entropy gating |
-| `semgrep.json` | Full Semgrep output (JSON) |
-| `retire.json` | Full Retire.js output (JSON) |
-| `trufflehog.json` | TruffleHog findings (JSONL) |
-| `comments.json` | Developer comment findings (JSONL) |
-| `dangling-js.json` | Nested JS references that 404'd (potential takeover) |
-| `exposed-maps.json` | Reachable source maps + extracted source-path list |
-| `wayback-maps.json` | Historical maps from Wayback Machine (Stage 5d) |
-| `well-known.json` | Probed well-known files (robots, sitemap, .well-known/*, leaks, …) |
-| `well-known-urls.txt` | URLs harvested from robots/sitemap chains |
-| `well-known-trust.json` | Trusted domains from crossdomain/clientaccesspolicy |
-| `well-known/` | Saved copies of every responding well-known file |
-| `dorks.json` | Generated Google dork URLs (active-recon mode) |
-| `recon-summary.json` | All files downloaded by active-recon (live + Wayback) |
-| `recon-secrets.json` | Secret-pattern hits in recon downloads |
-| `recon/` | Non-JS files downloaded by active-recon (configs, text, backups) |
-| `swagger-endpoints.json` | Endpoints extracted from discovered Swagger/OpenAPI docs |
-| `.semgrep-local.yaml` | Local Semgrep rules used for this run |
-
----
-
-## Known Limitations
-
-**Retire.js + Webpack bundles**
-Webpack's tree-shaking removes version strings that Retire.js fingerprints against. Bundled apps (React, Angular, Vue) will often show 0 libraries detected even when vulnerable versions are in use. Use `--dir` with the `node_modules/` folder or check `package-lock.json` directly for accurate version data.
-
-**Semgrep + Angular compiled templates**
-Angular compiles `[innerHTML]="x"` into runtime calls like `h("innerHTML", x, sanitizer)` — not a direct property assignment. The local rule set includes `pattern-regex` rules that catch this compiled form, but some patterns may still be missed in heavily tree-shaken output.
-
-**Authentication timeout**
-Session cookies expire. For long runs (large targets, slow Semgrep), re-authenticate and restart if you start seeing 401/302 responses in the live endpoint results.
-
-**NodeGoat / server-side apps in URL mode**
-Katana can only crawl pages it can reach as the authenticated user. Server-side JS files (`routes/`, `data/`) are never served to the browser. Use `--dir` to analyse them.
+MIT.

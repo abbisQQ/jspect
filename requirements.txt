@@ -9,3 +9,9 @@
 
 semgrep>=1.0
 jsbeautifier>=1.15
+
+# Optional — only needed when running with --ajax-spider.
+# After installing this package, you must also run:
+#     playwright install chromium
+# to download the browser binary (~150 MB on first run).
+playwright>=1.40
