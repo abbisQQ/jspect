@@ -3738,7 +3738,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
 #
 # YAML note: all pattern-regex values use single-quoted YAML strings. Never include a
 # literal single-quote character inside those strings — use ["] or omit it instead.
-_SEMGREP_LOCAL_RULES = """\
+_SEMGREP_DEFAULT_RULES = """\
 rules:
   - id: local-innerhtml-direct
     pattern: $X.innerHTML = $Y
@@ -4537,6 +4537,35 @@ rules:
 """
 
 
+# ── User-extensible rules overlay ─────────────────────────────────────────────
+# Operators can add custom Semgrep rules at this path. If the file exists, its
+# contents are appended to the defaults at scan time. The file format is just
+# a Semgrep `rules:` document; everything Semgrep accepts works.
+#   View / edit / save / reset from the web wizard at /rules
+#   Or `jspect --rules-path` to print the path + edit manually.
+USER_RULES_PATH = Path.home() / ".config" / "jspect" / "rules.yaml"
+
+
+def get_effective_rules() -> str:
+    """Return the YAML Semgrep should run — defaults + user rules if present.
+
+    Both rule sets fire side-by-side (no replacement). Rule-id collisions are
+    Semgrep's problem to surface, not ours.
+    """
+    out = _SEMGREP_DEFAULT_RULES
+    if USER_RULES_PATH.exists():
+        try:
+            user_yaml = USER_RULES_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return out
+        # User file should start with `rules:` — strip it and concatenate so we
+        # don't end up with two top-level `rules:` keys (Semgrep would error).
+        user_stripped = re.sub(r"^\s*rules\s*:\s*\n", "", user_yaml, count=1)
+        if user_stripped.strip():
+            out = out.rstrip() + "\n  # ── User-added rules ──\n" + user_stripped
+    return out
+
+
 def run_semgrep(target_dir, output_dir, available_tools):
     stage_header(6, "Semgrep (SAST)")
     if not available_tools.get("semgrep"):
@@ -4548,7 +4577,7 @@ def run_semgrep(target_dir, output_dir, available_tools):
     # Write local fallback rules — catches Angular compiled patterns that registry
     # rules miss because they look for AST-level property assignments, not function calls.
     local_rules = output_dir / ".semgrep-local.yaml"
-    local_rules.write_text(_SEMGREP_LOCAL_RULES, encoding="utf-8")
+    local_rules.write_text(get_effective_rules(), encoding="utf-8")
 
     cmd = [
         "semgrep",
@@ -6642,7 +6671,9 @@ button:disabled { opacity:0.4; cursor:not-allowed; }
 
   <div class="footer">
     <a href="/scans" style="color:#5eead4;text-decoration:none">📁 Previous scans</a>
-    &nbsp;·&nbsp; localhost only &nbsp;·&nbsp; single scan at a time &nbsp;·&nbsp; stdlib only
+    &nbsp;·&nbsp;
+    <a href="/rules" style="color:#5eead4;text-decoration:none">⚙️ Semgrep rules</a>
+    &nbsp;·&nbsp; localhost only &nbsp;·&nbsp; single scan at a time
   </div>
 </div>
 <script>
@@ -6790,6 +6821,87 @@ WEB_CANCEL_GRACE_S     = 3          # SIGTERM grace before SIGKILL on /cancel
 WEB_SSE_KEEPALIVE_S    = 30         # idle ping interval on /events/<id>
 WEB_JOB_ID_BYTES       = 8          # bytes of entropy in secrets.token_urlsafe()
 WEB_DEFAULT_SCAN_ROOT  = Path("/tmp/jspect-web")   # where /scans listing reads from
+
+
+# ── /rules page template ─────────────────────────────────────────────────────
+_WEB_RULES_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>jspect · Semgrep rules</title>
+<style>
+:root { --bg:#0f1115; --surface:#171a21; --surface-2:#1f242e; --border:#2a303c;
+        --text:#e6e8ec; --dim:#8b93a3; --accent:#5eead4;
+        --err:#ef4444; --warn:#f59e0b; --ok:#10b981; }
+body { font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:var(--bg); color:var(--text); margin:0; padding:32px 20px; }
+.container { max-width:920px; margin:0 auto; }
+h1 { font-size:22px; margin:0 0 4px; color:var(--accent); font-weight:600; }
+.sub { color:var(--dim); font-size:13px; margin-bottom:24px; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+h2 { font-size:14px; color:var(--dim); text-transform:uppercase;
+     letter-spacing:.5px; margin:30px 0 8px; font-weight:600; }
+textarea { width:100%; padding:14px; background:var(--bg); color:var(--text);
+    border:1px solid var(--border); border-radius:5px; font:12px/1.45 monospace;
+    resize:vertical; }
+textarea[readonly] { background:#0a0c10; color:var(--dim); }
+.path { color:var(--dim); font-size:11px; font-family:monospace;
+        background:var(--surface); padding:4px 8px; border-radius:3px;
+        display:inline-block; margin-bottom:6px; }
+.actions { display:flex; gap:8px; margin-top:14px; flex-wrap:wrap; align-items:center; }
+button { background:var(--accent); color:var(--bg); border:0; padding:9px 18px;
+    border-radius:5px; font-weight:600; font-size:13px; cursor:pointer; }
+button.secondary { background:var(--surface); color:var(--text); border:1px solid var(--border); }
+button.secondary:hover { border-color:var(--accent); }
+button.danger { background:transparent; color:var(--err); border:1px solid var(--err); }
+button.danger:hover { background:var(--err); color:var(--bg); }
+.note { background:rgba(94,234,212,0.06); border-left:3px solid var(--accent);
+    padding:10px 14px; border-radius:4px; margin:14px 0; font-size:12px; color:var(--dim); }
+nav { margin-bottom:18px; font-size:12px; }
+nav a { margin-right:14px; }
+</style></head><body><div class="container">
+  <nav>
+    <a href="/">← new scan</a>
+    <a href="/scans">📁 past scans</a>
+    <a href="/rules">⚙️ rules</a>
+  </nav>
+  <h1>⚙️ Semgrep rules</h1>
+  <div class="sub">Defaults ship with jspect. Add your own rules below — they're appended to the default ruleset on every scan.</div>
+
+  <h2>Default rules (read-only)</h2>
+  <textarea readonly rows="14">{default_rules}</textarea>
+
+  <h2>Your rules</h2>
+  <div class="path">{user_rules_path}</div>
+  <form id="rulesForm" method="POST" action="/rules/save">
+    <textarea name="rules" id="rules" rows="18" placeholder="rules:&#10;  - id: my-custom-check&#10;    pattern: $X.someThing()&#10;    message: example finding&#10;    languages: [javascript]&#10;    severity: WARNING">{user_rules}</textarea>
+    <div class="actions">
+      <button type="submit">💾 Save</button>
+      <button type="button" class="secondary" id="validateBtn">✓ Validate</button>
+      <button type="button" class="danger"    id="resetBtn">↺ Restore defaults</button>
+    </div>
+  </form>
+
+  <div class="note">
+    <strong>Format:</strong> standard Semgrep YAML — start your file with <code>rules:</code> followed by a list of rule objects. See <a href="https://semgrep.dev/docs/writing-rules/overview" target="_blank">Semgrep's writing-rules docs</a>.<br>
+    <strong>Tip:</strong> hit <strong>Validate</strong> before saving to catch syntax errors.<br>
+    <strong>Restore defaults</strong> deletes the user-rules file entirely (defaults are bundled in the tool — they're untouched).
+  </div>
+</div>
+<script>
+document.getElementById('validateBtn').addEventListener('click', () => {{
+    const form = document.getElementById('rulesForm');
+    form.action = '/rules/validate';
+    form.submit();
+    form.action = '/rules/save';   // reset for next click
+}});
+document.getElementById('resetBtn').addEventListener('click', async () => {{
+    if (!confirm('Delete your user-rules file and revert to the bundled defaults? Cannot be undone (your custom rules will be gone).')) return;
+    const r = await fetch('/rules/reset', {{method:'POST'}});
+    document.body.innerHTML = await r.text();
+}});
+</script>
+</body></html>
+"""
+
 
 # Job registry (in-memory — server is single-user, single-scan)
 import threading as _threading
@@ -6976,6 +7088,18 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
 </div></body></html>""")
                 return
 
+            # ── /rules — view defaults + edit user-added Semgrep rules ───────
+            if self.path == "/rules" or self.path == "/rules/":
+                user_yaml = ""
+                if USER_RULES_PATH.exists():
+                    try: user_yaml = USER_RULES_PATH.read_text(encoding="utf-8")
+                    except OSError: pass
+                self._send_html(_WEB_RULES_HTML
+                                .replace("{user_rules}", html_escape(user_yaml))
+                                .replace("{default_rules}", html_escape(_SEMGREP_DEFAULT_RULES))
+                                .replace("{user_rules_path}", html_escape(str(USER_RULES_PATH))))
+                return
+
             # ── /scans/<dirname>/files[...] and /scans/<dirname>/report ──────
             # Browse / serve from a scan directory on disk (no in-memory job needed).
             if self.path.startswith("/scans/"):
@@ -7107,6 +7231,77 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
             self._send_html("404", 404)
 
         def do_POST(self) -> None:
+            # POST /rules/save        — write submitted YAML to USER_RULES_PATH
+            # POST /rules/reset       — delete USER_RULES_PATH (back to defaults)
+            # POST /rules/validate    — semgrep --validate the submitted YAML
+            if self.path.startswith("/rules/"):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length).decode("utf-8") if length else ""
+                form = _up.parse_qs(raw, keep_blank_values=True)
+                body = (form.get("rules", [""])[0] or "")
+
+                if self.path == "/rules/save":
+                    try:
+                        USER_RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+                        USER_RULES_PATH.write_text(body, encoding="utf-8")
+                        self._send_html(
+                            f"<p>✓ saved {len(body)} bytes to "
+                            f"<code>{html_escape(str(USER_RULES_PATH))}</code></p>"
+                            f"<p><a href='/rules'>← back to rules</a></p>")
+                    except OSError as exc:
+                        self._send_html(f"<h1>save failed</h1><p>{html_escape(str(exc))}</p>", 500)
+                    return
+
+                if self.path == "/rules/reset":
+                    try:
+                        if USER_RULES_PATH.exists():
+                            USER_RULES_PATH.unlink()
+                        self._send_html(
+                            f"<p>✓ user-rules file deleted — defaults restored.</p>"
+                            f"<p><a href='/rules'>← back to rules</a></p>")
+                    except OSError as exc:
+                        self._send_html(f"<h1>reset failed</h1><p>{html_escape(str(exc))}</p>", 500)
+                    return
+
+                if self.path == "/rules/validate":
+                    # Write to a tmp file + run `semgrep --validate`
+                    import tempfile as _tempfile
+                    if not body.strip():
+                        self._send_html("<p class='ok'>✓ empty input is trivially valid</p>"
+                                        "<p><a href='/rules'>← back</a></p>")
+                        return
+                    with _tempfile.NamedTemporaryFile(
+                            mode="w", suffix=".yaml", delete=False) as fh:
+                        fh.write(body); tmp_path = fh.name
+                    try:
+                        result = subprocess.run(
+                            ["semgrep", "--validate", "--config", tmp_path],
+                            capture_output=True, text=True, timeout=15,
+                        )
+                        ok = result.returncode == 0
+                        out = (result.stdout or "") + (result.stderr or "")
+                        self._send_html(
+                            f"<style>body{{font:13px monospace;background:#0f1115;"
+                            f"color:#e6e8ec;padding:24px}}"
+                            f"pre{{background:#171a21;padding:12px;border-radius:5px;"
+                            f"white-space:pre-wrap}} .ok{{color:#10b981}} "
+                            f".err{{color:#ef4444}}</style>"
+                            f"<h2 class='{('ok' if ok else 'err')}'>"
+                            f"{'✓ valid' if ok else '✗ invalid'}</h2>"
+                            f"<pre>{html_escape(out)}</pre>"
+                            f"<p><a href='/rules' style='color:#5eead4'>← back to rules</a></p>")
+                    except FileNotFoundError:
+                        self._send_html("<h1>semgrep not installed</h1>"
+                                        "<p>install semgrep to validate rules.</p>", 500)
+                    except subprocess.TimeoutExpired:
+                        self._send_html("<h1>validation timed out</h1>", 500)
+                    finally:
+                        try: os.unlink(tmp_path)
+                        except OSError: pass
+                    return
+
+                self._send_html("404", 404); return
+
             # POST /jobs/<id>/cancel — kill a running scan
             if self.path.startswith("/jobs/") and self.path.endswith("/cancel"):
                 job_id = self.path.split("/")[2]
@@ -7289,6 +7484,9 @@ def main():
                        help="Web wizard bind address (default 127.0.0.1 — localhost only)")
     modes.add_argument("--help-advanced", action="store_true",
                        help="Show all advanced / profile-override flags and exit")
+    modes.add_argument("--rules-path", action="store_true",
+                       help="Print the path to your user-rules YAML and exit. "
+                            "Add custom Semgrep rules there to extend the defaults.")
 
     # ── Advanced (override profile values — hidden from default help) ─────────
     # We add these to a group named "Advanced" so they appear if the user asks
@@ -7353,6 +7551,13 @@ def main():
     # filtering Advanced out of the default view if we add a custom formatter).
     if getattr(args, "help_advanced", False):
         parser.print_help()
+        sys.exit(0)
+
+    if getattr(args, "rules_path", False):
+        # Ensure the parent dir exists so users can create the file straight away
+        USER_RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        exists_note = " (exists)" if USER_RULES_PATH.exists() else " (not yet created — make it to add rules)"
+        print(f"{USER_RULES_PATH}{exists_note}")
         sys.exit(0)
 
     # Apply profile defaults to any flag the user didn't explicitly set.

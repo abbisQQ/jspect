@@ -172,4 +172,6 @@ Each stage is graceful — missing tools / failed crawls / empty corpora don't b
 
 ## License
 
-MIT.
+[MIT](LICENSE) — free to use, modify, distribute, including commercially.
+
+Only scan systems you own or have **explicit written authorization** to test. Automated tooling can trigger WAFs, exhaust rate limits, fill audit logs, and submit forms — review the `--ajax-fill-forms` and `--verify-secrets` sections before pointing it at production third-party services.
