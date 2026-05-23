@@ -170,6 +170,32 @@ Each stage is graceful — missing tools / failed crawls / empty corpora don't b
 
 ---
 
+## Acknowledgments
+
+jspect orchestrates a pipeline of excellent open-source tools — full credit to their authors.
+
+**Required binaries**
+- [Katana](https://github.com/projectdiscovery/katana) (ProjectDiscovery) — web crawler
+- [JSluice](https://github.com/BishopFox/jsluice) (BishopFox) — AST-based URL + secret extraction from JavaScript
+- [Semgrep](https://github.com/semgrep/semgrep) (Semgrep, Inc.) — static analysis engine; rules at [semgrep.dev/explore](https://semgrep.dev/explore)
+- [Retire.js](https://github.com/RetireJS/retire.js) (Erlend Oftedal) — known-vulnerable JavaScript library detection
+- [TruffleHog](https://github.com/trufflesecurity/trufflehog) (Truffle Security) — high-entropy secret detection
+
+**Optional**
+- [Playwright](https://github.com/microsoft/playwright) (Microsoft) — headless Chromium for the `--ajax-spider` stage
+- [sourcemapper](https://github.com/denandz/sourcemapper) (denandz) — source-map unpacking
+- [unwebpack-sourcemap](https://github.com/rarecoil/unwebpack-sourcemap) (rarecoil) — fallback source-map extractor
+- [jsbeautifier](https://github.com/beautifier/js-beautify) (Einar Lielmanis et al.) — JS beautification
+- [MapperPlus](https://github.com/Zierax/MapperPlus) (Zierax) — alternative source-map helper, auto-detected if cloned into `./mapperplus/`
+
+**Data sources**
+- [Wayback Machine CDX API](https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server) (Internet Archive) — historical `.js.map` URLs (Stage 5d)
+- [Google Custom Search JSON API](https://developers.google.com/custom-search/v1/overview) — optional auto-fetch of `--active-recon` dorks when `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` env vars are set
+
+Inspired by the broader JS-recon community — particularly the writeups collected in [insecrez/Bug-bounty-Writeups](https://github.com/insecrez/Bug-bounty-Writeups) and [devanshbatham/Awesome-Bugbounty-Writeups](https://github.com/devanshbatham/Awesome-Bugbounty-Writeups), which informed several of the bundled Semgrep rules.
+
+---
+
 ## License
 
 [MIT](LICENSE) — free to use, modify, distribute, including commercially.
