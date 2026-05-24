@@ -6895,17 +6895,19 @@ nav a { margin-right:14px; }
   </div>
 </div>
 <script>
-document.getElementById('validateBtn').addEventListener('click', () => {{
+// _WEB_RULES_HTML is a plain triple-quoted string (NOT an f-string), so
+// JavaScript braces are written single — no Python-style doubling.
+document.getElementById('validateBtn').addEventListener('click', () => {
     const form = document.getElementById('rulesForm');
     form.action = '/rules/validate';
     form.submit();
     form.action = '/rules/save';   // reset for next click
-}});
-document.getElementById('resetBtn').addEventListener('click', async () => {{
+});
+document.getElementById('resetBtn').addEventListener('click', async () => {
     if (!confirm('Delete your user-rules file and revert to the bundled defaults? Cannot be undone (your custom rules will be gone).')) return;
-    const r = await fetch('/rules/reset', {{method:'POST'}});
+    const r = await fetch('/rules/reset', {method: 'POST'});
     document.body.innerHTML = await r.text();
-}});
+});
 </script>
 </body></html>
 """
