@@ -998,17 +998,40 @@ def _spider_should_skip_form(form_el, mode: str) -> tuple[bool, str]:
     except Exception:
         pass
 
-    # Checkout / payment forms — destructive even with fake data
+    # Checkout / payment forms — destructive even with fake data.
+    # Check both visible text AND input attributes (name, placeholder,
+    # autocomplete, aria-label, id) — modern payment UIs commonly use
+    # placeholder-only labels (e.g. "Card number" / "CVV" as placeholders),
+    # which text_content() does NOT pick up. Skipping this gate would let
+    # --ajax-fill-forms=all POST garbage to a real payment endpoint.
+    PAY_KEYWORDS = (
+        "credit card", "card number", "cvv", "cvc",
+        "stripe", "paypal", "checkout", "place order",
+        "complete purchase", "billing address",
+        "cardnumber", "card-number", "card_number",
+        "cc-number", "cc_number", "ccnumber",
+        "expir",  # expiry / expiration
+    )
     try:
         form_text = (form_el.text_content() or "").lower()[:1000]
     except Exception:
         form_text = ""
-    if any(kw in form_text for kw in (
-        "credit card", "card number", "cvv", "cvc",
-        "stripe", "paypal", "checkout", "place order",
-        "complete purchase", "billing address",
-    )):
-        return True, "payment/checkout form"
+    if any(kw in form_text for kw in PAY_KEYWORDS):
+        return True, "payment/checkout form (text match)"
+
+    # Probe input attributes that often carry the only payment signal in
+    # placeholder-driven UIs.
+    try:
+        haystack = form_el.evaluate(
+            "f => Array.from(f.querySelectorAll('input,select,textarea'))"
+            "  .map(e => [e.getAttribute('name')||'', e.getAttribute('placeholder')||'',"
+            "             e.getAttribute('autocomplete')||'', e.getAttribute('aria-label')||'',"
+            "             e.getAttribute('id')||''].join(' ').toLowerCase()).join(' | ')"
+        ) or ""
+    except Exception:
+        haystack = ""
+    if any(kw in haystack for kw in PAY_KEYWORDS):
+        return True, "payment/checkout form (attribute match)"
 
     return False, ""
 
@@ -7288,8 +7311,23 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                             ["semgrep", "--validate", "--config", tmp_path],
                             capture_output=True, text=True, timeout=15,
                         )
-                        ok = result.returncode == 0
                         out = (result.stdout or "") + (result.stderr or "")
+                        # semgrep --validate returns rc=0 even for malformed YAML
+                        # (it just prints "[ERROR]" to stdout), so we additionally
+                        # sniff the output for error markers + parse the YAML
+                        # ourselves to surface syntax errors the user expects to see.
+                        ok = result.returncode == 0
+                        if ok and ("[ERROR]" in out or "Invalid YAML" in out):
+                            ok = False
+                        if ok:
+                            try:
+                                import yaml as _yaml
+                                _yaml.safe_load(body)
+                            except ImportError:
+                                pass
+                            except Exception as yexc:
+                                ok = False
+                                out += f"\n[ERROR] YAML parse error: {yexc}"
                         self._send_html(
                             f"<style>body{{font:13px monospace;background:#0f1115;"
                             f"color:#e6e8ec;padding:24px}}"
