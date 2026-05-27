@@ -488,9 +488,23 @@ def _parse_raw_http_request(text: str) -> dict:
         raise ValueError("no Host / :authority header found — can't build URL")
 
     if scheme is None:
-        # Default to https — Burp's clipboard export from HTTPS sessions is
-        # the vast majority of paste sources.
-        scheme = "https"
+        # Heuristic — Burp omits the scheme from the request line, but the
+        # port + hostname usually give it away. Localhost / loopback / a
+        # plain-http port → http; otherwise default to https (Burp's most
+        # common paste source).
+        host_lc = host.lower()
+        port = ""
+        if ":" in host_lc:
+            port = host_lc.rsplit(":", 1)[1]
+        hostname_only = host_lc.rsplit(":", 1)[0] if ":" in host_lc else host_lc
+        _LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+        _PLAIN_HTTP_PORTS = {"80", "8000", "8001", "8008", "8080", "8081",
+                              "8888", "3000", "4000", "5000", "9000", "9999"}
+        if hostname_only in _LOCAL_HOSTS or hostname_only.endswith(".local") \
+                or port in _PLAIN_HTTP_PORTS:
+            scheme = "http"
+        else:
+            scheme = "https"
 
     url = f"{scheme}://{host}{path}"
     return {"url": url, "method": method, "headers": headers, "body": body}
@@ -7073,11 +7087,22 @@ def _spawn_scan_subprocess(args_dict: dict, job_id: str, output_dir: Path) -> No
     log_q.put(f"$ {' '.join(cmd)}")
 
     try:
+        # /cancel may have been called before we got here — bail before spawning.
+        if _JOBS[job_id].get("cancel_requested"):
+            _JOBS[job_id]["status"] = "cancelled"
+            log_q.put("[!] scan cancelled before launch")
+            log_q.put("__CRASHED__")
+            return
         env = os.environ.copy()
         env["NO_COLOR"] = "1"   # strip ANSI in subprocess output for cleaner web display
         proc = _subprocess.Popen(cmd, stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT,
                                   text=True, bufsize=1, env=env)
         _JOBS[job_id]["process"] = proc
+        # Re-check in case the cancel arrived in the tiny window between the
+        # initial check and the spawn — kill immediately.
+        if _JOBS[job_id].get("cancel_requested"):
+            try: proc.terminate()
+            except Exception: pass
         for line in iter(proc.stdout.readline, ""):
             # Strip residual ANSI if any
             clean = re.sub(r"\x1b\[[0-9;]*m", "", line.rstrip("\n"))
@@ -7422,11 +7447,21 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                 job = _JOBS.get(job_id)
                 if not job:
                     self._send_html("404", 404); return
+                # Always mark cancel_requested so a not-yet-spawned worker
+                # bails before starting (avoids the spawn / cancel race that
+                # used to return 409 when the user clicked Stop right after
+                # submitting the form).
+                job["cancel_requested"] = True
                 proc = job.get("process")
-                if proc is None:
-                    self._send_html("scan not yet running", 409); return
-                if proc.poll() is not None:
-                    self._send_html("scan already finished", 409); return
+                if proc is None or proc.poll() is not None:
+                    # Either the subprocess hasn't started yet (worker will
+                    # see cancel_requested and exit), or it's already done.
+                    # Both are fine — 204 keeps the UI in sync.
+                    if job.get("status") == "running":
+                        job["status"] = "cancelled"
+                        job["log_q"].put("[!] scan cancelled (not yet running / already finished)")
+                        job["log_q"].put("__CRASHED__")
+                    self.send_response(204); self.end_headers(); return
                 try:
                     proc.terminate()           # SIGTERM first — give it a moment to clean up
                     try:
