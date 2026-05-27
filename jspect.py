@@ -7783,8 +7783,11 @@ def main():
         if args.ajax_spider:
             spider_file = ajax_spider(
                 args.url, output_dir, args.header, katana_out=katana_out,
-                max_pages=args.ajax_max_pages, max_clicks=args.ajax_max_clicks,
-                depth=args.ajax_depth,
+                # CLI flags default to None (so profiles can override them).
+                # Fall back to module defaults when nothing's been set.
+                max_pages=args.ajax_max_pages or AJAX_SPIDER_PAGES_DEFAULT,
+                max_clicks=args.ajax_max_clicks or AJAX_SPIDER_CLICKS_DEFAULT,
+                depth=args.ajax_depth or AJAX_SPIDER_DEPTH,
                 fill_forms_mode=args.ajax_fill_forms,
                 proxy=args.proxy, proxy_insecure=args.proxy_insecure,
             )
