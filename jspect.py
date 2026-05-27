@@ -1226,28 +1226,72 @@ def _spider_interact_with_page(page, page_url: str, target_host: str,
                 pass
         except Exception as exc:
             Log.debug(f"form-pass: re-navigate failed: {exc}")
-        try:
-            forms = page.query_selector_all("form")
-        except Exception:
-            forms = []
-        for form_el in forms:
-            if _time.monotonic() > deadline_monotonic:
-                break
-            sig = _spider_element_signature(form_el)
-            if sig is None or sig in clicked_sigs:
-                continue
-            submitted, info = _spider_fill_one_form(form_el, fill_forms_mode)
-            clicked_sigs.add(sig)
-            if submitted:
-                forms_submitted += 1
-                Log.info(f"    {C.YELLOW}[!]{C.RESET} form-fill ({fill_forms_mode}): {info}")
+        # Submitting any form (GET or POST) typically navigates the page,
+        # which detaches every other <form> element handle in the list. To
+        # exercise more than one form per page we have to re-query after
+        # each successful submission. Outer loop re-navigates + re-queries
+        # until no new form gets submitted.
+        seen_form_sigs: set = set()
+        while _time.monotonic() < deadline_monotonic:
+            try:
+                page.wait_for_load_state("load",
+                                          timeout=AJAX_SPIDER_NAV_TIMEOUT * 1000)
+            except Exception:
+                pass
+            # Unconditional re-nav with one retry — a form submit may have
+            # queued a navigation that hasn't fired yet, so an immediate
+            # goto(page_url) can be interrupted by that queued nav. If so,
+            # wait briefly for it to settle and retry.
+            nav_ok = False
+            for _attempt in range(2):
                 try:
-                    page.wait_for_load_state("networkidle",
-                                              timeout=AJAX_SPIDER_POST_CLICK_IDLE * 1000)
-                except PWTimeout:
-                    pass
-            else:
-                Log.verbose(f"    [v] form-fill skipped: {info}")
+                    page.goto(page_url, timeout=AJAX_SPIDER_NAV_TIMEOUT * 1000,
+                              wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_load_state("networkidle",
+                                                  timeout=AJAX_SPIDER_NETWORK_IDLE * 1000)
+                    except PWTimeout:
+                        pass
+                    nav_ok = True
+                    break
+                except Exception:
+                    # Likely interrupted by a queued nav from the previous
+                    # form submit — wait for it to settle, then retry once.
+                    try:
+                        page.wait_for_load_state("load",
+                                                  timeout=AJAX_SPIDER_NAV_TIMEOUT * 1000)
+                    except Exception:
+                        pass
+            if not nav_ok:
+                break
+            try:
+                forms = page.query_selector_all("form")
+            except Exception:
+                break
+
+            progressed = False
+            for form_el in forms:
+                if _time.monotonic() > deadline_monotonic:
+                    break
+                sig = _spider_element_signature(form_el)
+                if sig is None or sig in seen_form_sigs or sig in clicked_sigs:
+                    continue
+                submitted, info = _spider_fill_one_form(form_el, fill_forms_mode)
+                seen_form_sigs.add(sig)
+                if submitted:
+                    forms_submitted += 1
+                    Log.info(f"    {C.YELLOW}[!]{C.RESET} form-fill ({fill_forms_mode}): {info}")
+                    try:
+                        page.wait_for_load_state("networkidle",
+                                                  timeout=AJAX_SPIDER_POST_CLICK_IDLE * 1000)
+                    except PWTimeout:
+                        pass
+                    progressed = True
+                    break   # restart outer loop — page likely navigated
+                else:
+                    Log.verbose(f"    [v] form-fill skipped: {info}")
+            if not progressed:
+                break
 
     return clicks_done, forms_submitted, skipped_destructive, errors
 
