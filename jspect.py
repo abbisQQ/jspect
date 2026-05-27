@@ -1204,6 +1204,28 @@ def _spider_interact_with_page(page, page_url: str, target_host: str,
 
     # Form-fill pass — runs once after the click loop, only when explicitly opted-in.
     if fill_forms_mode != "off" and _time.monotonic() < deadline_monotonic:
+        # A same-origin link clicked during the click loop may have navigated
+        # the page away from page_url — re-load the original page so the
+        # form-fill pass sees the forms the user actually wants tested.
+        # First, wait for any in-flight navigation to settle so our goto
+        # isn't interrupted; then re-navigate to page_url.
+        try:
+            page.wait_for_load_state("load",
+                                      timeout=AJAX_SPIDER_NAV_TIMEOUT * 1000)
+        except PWTimeout:
+            pass
+        except Exception:
+            pass
+        try:
+            page.goto(page_url, timeout=AJAX_SPIDER_NAV_TIMEOUT * 1000,
+                      wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle",
+                                          timeout=AJAX_SPIDER_NETWORK_IDLE * 1000)
+            except PWTimeout:
+                pass
+        except Exception as exc:
+            Log.debug(f"form-pass: re-navigate failed: {exc}")
         try:
             forms = page.query_selector_all("form")
         except Exception:
