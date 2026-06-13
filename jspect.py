@@ -52,7 +52,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 
 def _in_docker() -> bool:
@@ -798,7 +798,13 @@ AJAX_SPIDER_NETWORK_IDLE     = 5     # seconds — wait for SPA hydration after 
 AJAX_SPIDER_POST_CLICK_IDLE  = 2     # seconds — wait after each click for any triggered XHR
 AJAX_SPIDER_TIMEOUT          = 180   # seconds — total cap across all pages
 AJAX_SPIDER_PAGES_DEFAULT    = 15    # how many Katana-discovered pages to also visit
-                                      # (breadth-first picker — see _spider_pick_pages)
+                                      # (breadth-first picker — see _pick_pages_breadth_first)
+
+# ── Stage 1c: Static HTML URL-hint extraction ────────────────────────────────
+HTML_HINT_PAGES_CAP        = 100    # cap on pages fetched for HTML hint regex sweep
+HTML_HINT_FETCH_TIMEOUT_S  = 6      # per-page urlopen timeout
+HTML_HINT_CONCURRENCY      = 10     # parallel HTTP workers
+HTML_HINT_BODY_CAP_BYTES   = 512_000  # truncate response body before regex
 AJAX_SPIDER_CLICKS_DEFAULT   = 25    # max interactive elements clicked per page (initial pass)
 AJAX_SPIDER_DEPTH            = 2     # interaction depth — re-query after each pass to find revealed elements
 AJAX_SPIDER_CLICK_TIMEOUT    = 2     # seconds — per-click timeout (Playwright default is 30s, way too long)
@@ -951,20 +957,23 @@ def apply_profile(args, profile_name: str) -> None:
             setattr(args, key, value)
 
 
-def _spider_pick_pages(target: str, katana_out: Path | None, max_pages: int) -> list[str]:
-    """Pick which pages the AJAX spider should visit.
+def _pick_pages_breadth_first(target: str, katana_out: Path | None,
+                              max_pages: int,
+                              scan_all_below: bool = False) -> list[str]:
+    """Pick which pages downstream stages should fetch / interact with.
 
-    Always includes the seed URL. Then prefers BREADTH: one page per
-    first-two-path-segments prefix (so /test/buttons/, /test/forms/,
-    /admin/users/ each get sampled instead of taking 8 consecutive
-    pages from one section). Falls back to FIFO once breadth is covered.
+    Always returns the seed URL first. Then, from `katana-out.txt`:
+      • non-HTML asset URLs are skipped (.js, .css, images, etc.)
+      • if `scan_all_below` is True AND we have fewer candidates than the cap,
+        return ALL candidates (small sites + benchmarks get full coverage)
+      • otherwise breadth-first by /seg1/seg2/ prefix, then FIFO fill
+
+    Shared by Stage 1b (AJAX spider) and Stage 1c (HTML hint extractor).
     """
     pages: list[str] = [target]
     if not katana_out or not katana_out.exists():
         return pages
     seen = {target}
-
-    # Collect candidates once
     candidates: list[str] = []
     for line in katana_out.open():
         u = line.strip()
@@ -973,31 +982,42 @@ def _spider_pick_pages(target: str, katana_out: Path | None, max_pages: int) -> 
         if u.split("?", 1)[0].lower().endswith(_NON_PAGE_EXTENSIONS):
             continue
         candidates.append(u)
+        seen.add(u)
 
-    # Pass 1: one URL per /seg1/seg2/ prefix — breadth-first
+    # Small sites: skip the breadth sampling and scan everything we have budget for.
+    if scan_all_below and len(candidates) <= max_pages - 1:
+        return [target] + candidates
+
+    # Pass 1: one URL per /seg1/seg2/ prefix — breadth-first.
+    # Budget check goes BEFORE append so seed counts toward `max_pages`.
+    pages = [target]
+    seen = {target}
     seen_prefix: set = set()
     for u in candidates:
+        if len(pages) >= max_pages: return pages
         try:
-            path = urllib.parse.urlparse(u).path
+            segs = [s for s in urlparse(u).path.split("/") if s][:2]
         except Exception:
             continue
-        segs = [s for s in path.split("/") if s][:2]
         prefix = "/" + "/".join(segs)
-        if prefix in seen_prefix:
-            continue
-        seen_prefix.add(prefix)
-        seen.add(u)
-        pages.append(u)
-        if len(pages) >= max_pages:
-            return pages
+        if prefix in seen_prefix: continue
+        seen_prefix.add(prefix); seen.add(u); pages.append(u)
 
-    # Pass 2: fill any remaining budget FIFO
+    # Pass 2: fill any remaining budget FIFO.
     for u in candidates:
+        if len(pages) >= max_pages: break
         if u in seen: continue
         seen.add(u); pages.append(u)
-        if len(pages) >= max_pages:
-            break
     return pages
+
+
+def _spider_pick_pages(target: str, katana_out: Path | None, max_pages: int) -> list[str]:
+    """Thin wrapper kept for Stage 1b call sites. The AJAX spider doesn't want
+    to drown a small benchmark in repeat visits, so it doesn't use the
+    `scan_all_below` shortcut — breadth coverage matters more than depth here.
+    """
+    return _pick_pages_breadth_first(target, katana_out, max_pages,
+                                      scan_all_below=False)
 
 
 def _spider_is_destructive(el) -> bool:
@@ -1542,21 +1562,19 @@ def ajax_spider(target: str,
     return spider_file
 
 
-# ── Stage 1c: Static HTML URL-hint extraction ─────────────────────────────────
+# ── Stage 1c: Static HTML URL-hint extraction ────────────────────────────────
 # Things real apps put in HTML that crawlers + headless Chrome routinely miss:
-#   • <meta http-equiv="refresh" content="N; url=X">    — login/oauth redirects
+#   • <meta http-equiv="refresh" content="N; url=X">    — login / oauth redirects
 #   • <noscript><a href="X">…</a></noscript>            — graceful-degrade pages
-#   • inline event handlers:
-#       onclick="...location.href='X'..." / onmouseover / ondblclick / etc.
-#       data-href="X", data-url="X" (common SPA + jQuery patterns)
-# These often hide admin / debug / hidden-feature URLs the crawler never follows.
-#
-# We do a regex sweep (no HTML parser dep) over the seed page + a diverse sample
-# of katana pages, append discoveries to katana-out.txt so they ride through
-# Stage 2 download + Stage 5 live validation transparently.
+#   • inline event handlers (onclick / onmouseover / …) → location.href = 'X'
+#   • data-href / data-url / data-link / data-route / data-nav / data-target
+#     (SPA + jQuery click-delegator patterns)
+# Discoveries flow into html-hints.json + endpoints.json so Stage 5 live-
+# validation probes them — that's how a hidden URL behind a meta-refresh
+# / noscript / inline-handler ever gets HIT.
 
 _HTML_HINT_PATTERNS = [
-    # <meta http-equiv="refresh" content="0; url=/foo"> (case-insensitive, ;/, separator)
+    # <meta http-equiv="refresh" content="0; url=/foo"> (case-insensitive, ; or , separator)
     ("meta-refresh", re.compile(
         r"""<meta\s+[^>]*http-equiv\s*=\s*['"]?refresh['"]?[^>]*content\s*=\s*"""
         r"""['"][^'"]*?[;,]\s*url\s*=\s*([^'">\s]+)""",
@@ -1564,7 +1582,7 @@ _HTML_HINT_PATTERNS = [
     # <noscript> ... <a href="..."> ... </noscript>
     ("noscript-anchor", re.compile(
         r"<noscript[^>]*>(.*?)</noscript>", re.IGNORECASE | re.DOTALL)),
-    # Inline event-handler navigation (onclick, onmouseover, ondblclick, onfocus, ...)
+    # Inline event-handler navigation
     ("inline-handler", re.compile(
         r"""on(?:click|mouseover|dblclick|focus|change|keydown|keyup|submit)\s*=\s*"""
         r"""['"][^'"]*?(?:location\.href|window\.location\.href|window\.location|location)"""
@@ -1576,180 +1594,125 @@ _HTML_HINT_PATTERNS = [
 ]
 _NOSCRIPT_HREF_RE = re.compile(r"""<a\s+[^>]*href\s*=\s*['"]([^'"]+)['"]""",
                                re.IGNORECASE)
-
-_HTML_HINT_PAGES_CAP = 100     # how many pages we fetch HTML for, max
-                                # (~10s at 6s/page with 10 concurrent workers)
-_HTML_HINT_FETCH_TIMEOUT = 6   # seconds per page
-_HTML_HINT_CONCURRENCY = 10    # parallel HTTP workers
+_HINT_REJECT_SCHEMES = ("javascript:", "mailto:", "tel:", "data:", "blob:")
 
 
-def _hint_pick_pages(target: str, katana_out: Path,
-                     cap: int = _HTML_HINT_PAGES_CAP) -> list[str]:
-    """Pick which pages to scan for hints.
+def _normalize_hint_url(href: str, page_url: str,
+                        seed_netloc: str) -> str | None:
+    """Resolve a raw href to an absolute same-origin URL, or None.
 
-    Strategy:
-      • If we have ≤ cap unique candidates, scan ALL of them (small sites and
-        benchmarks like crawlground get full coverage).
-      • If we have > cap, do a breadth-first sample: one per /seg1/seg2/ prefix
-        first, then fill the remaining budget FIFO. This avoids spending the
-        whole budget on /blog/post-1, /blog/post-2, … on big content sites.
+    Drops noise (javascript:, mailto:, fragments). Same-origin is enforced by
+    netloc equality — NOT a substring/prefix test, which would let
+    `http://example.com.evil.com/x` through when the seed is example.com.
     """
-    out: list[str] = [target]
-    if not katana_out or not katana_out.exists():
-        return out
-    seen_urls = {target}
-    candidates = []
-    for line in katana_out.open():
-        u = line.strip()
-        if not u or u in seen_urls or not u.startswith(("http://", "https://")):
-            continue
-        if u.split("?", 1)[0].lower().endswith(_NON_PAGE_EXTENSIONS):
-            continue
-        candidates.append(u)
-        seen_urls.add(u)
-
-    if len(candidates) <= cap - 1:
-        # Plenty of budget — scan everything we found
-        out.extend(candidates)
-        return out
-
-    # Tight budget: breadth-first by /seg1/seg2/ prefix, then FIFO fill
-    out = [target]
-    seen_urls = {target}
-    seen_prefix: set = set()
-    for u in candidates:
-        try:
-            path = urllib.parse.urlparse(u).path
-        except Exception:
-            continue
-        segs = [s for s in path.split("/") if s][:2]
-        prefix = "/" + "/".join(segs)
-        if prefix in seen_prefix: continue
-        seen_prefix.add(prefix); seen_urls.add(u); out.append(u)
-        if len(out) >= cap: return out
-    for u in candidates:
-        if u in seen_urls: continue
-        seen_urls.add(u); out.append(u)
-        if len(out) >= cap: break
-    return out
+    if not href: return None
+    href = href.strip().strip("'\"")
+    if not href or href.startswith("#"):
+        return None
+    if href.lower().startswith(_HINT_REJECT_SCHEMES):
+        return None
+    try:
+        abs_url = urljoin(page_url, href)
+        netloc = urlparse(abs_url).netloc
+    except Exception:
+        return None
+    if seed_netloc and netloc.lower() != seed_netloc.lower():
+        return None
+    return abs_url
 
 
 def extract_html_hints(target: str, katana_out: Path, output_dir: Path,
                        headers: list[str]) -> dict:
     """Stage 1c — fetch a diverse page sample, regex-extract URL hints
-    katana wouldn't follow naturally, append to katana-out.txt + save artifact.
+    katana / headless Chrome wouldn't follow naturally. Discoveries are
+    appended to both `katana-out.txt` (so Stage 2 download_js sees them)
+    AND `endpoints.json` (so Stage 5 live-validation probes them).
 
-    Returns {"pages_scanned": N, "hints": M, "new_urls": K}.
+    Returns a summary dict: {"pages_scanned", "hints", "new_urls"}.
     """
     stage_header("1c", "Static HTML URL-hint extraction")
+    summary = {"pages_scanned": 0, "hints": 0, "new_urls": 0}
     if not katana_out or not katana_out.exists():
         Log.info("    [-] No katana-out to seed from")
-        return {"pages_scanned": 0, "hints": 0, "new_urls": 0}
+        return summary
 
-    pages = _hint_pick_pages(target, katana_out)
+    pages = _pick_pages_breadth_first(target, katana_out,
+                                       HTML_HINT_PAGES_CAP,
+                                       scan_all_below=True)
     hdr = parse_headers(headers)
+    seed_netloc = urlparse(target).netloc
 
-    # URLs already known (case-sensitive set match) so we only add genuinely new ones.
-    known: set = set()
+    # URLs already known (line-equality match) so we only emit genuinely new ones.
     with katana_out.open() as f:
-        for ln in f:
-            u = ln.strip()
-            if u: known.add(u)
+        known: set = {ln.strip() for ln in f if ln.strip()}
 
-    hits: list[dict] = []   # written to html-hints.json
-    new_urls: list[str] = []
-    pages_scanned = 0
-    seed_origin = _build_origin(target)
+    hits: list[dict] = []
 
     def _fetch_one(page_url: str) -> tuple[str, str] | None:
         try:
             req = urllib.request.Request(page_url, headers=hdr)
-            with urllib.request.urlopen(req, timeout=_HTML_HINT_FETCH_TIMEOUT,
+            with urllib.request.urlopen(req, timeout=HTML_HINT_FETCH_TIMEOUT_S,
                                          context=permissive_ssl_context()) as resp:
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 if "html" not in ctype and "xml" not in ctype:
                     return None
-                return page_url, resp.read(512_000).decode("utf-8", errors="ignore")
-        except Exception:
+                body = resp.read(HTML_HINT_BODY_CAP_BYTES)
+                return page_url, body.decode("utf-8", errors="ignore")
+        except (urllib.error.URLError, OSError, ValueError):
             return None
 
+    def _extract_from(body: str, page_url: str) -> None:
+        for kind, rx in _HTML_HINT_PATTERNS:
+            for m in rx.finditer(body):
+                # noscript pattern yields a whole block — pull each <a href> inside.
+                if kind == "noscript-anchor":
+                    for a in _NOSCRIPT_HREF_RE.finditer(m.group(1)):
+                        url = _normalize_hint_url(a.group(1), page_url, seed_netloc)
+                        if url and url not in known:
+                            known.add(url)
+                            hits.append({"kind": kind, "url": url, "from": page_url})
+                    continue
+                url = _normalize_hint_url(m.group(1), page_url, seed_netloc)
+                if url and url not in known:
+                    known.add(url)
+                    hits.append({"kind": kind, "url": url, "from": page_url})
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    with ThreadPoolExecutor(max_workers=_HTML_HINT_CONCURRENCY) as pool:
-        for fut in as_completed([pool.submit(_fetch_one, u) for u in pages]):
+    with ThreadPoolExecutor(max_workers=HTML_HINT_CONCURRENCY) as pool:
+        futures = [pool.submit(_fetch_one, u) for u in pages]
+        for fut in as_completed(futures):
             res = fut.result()
             if not res: continue
             page_url, body = res
-            pages_scanned += 1
+            summary["pages_scanned"] += 1
+            _extract_from(body, page_url)
 
-            for kind, rx in _HTML_HINT_PATTERNS:
-                for m in rx.finditer(body):
-                    if kind == "noscript-anchor":
-                        for a in _NOSCRIPT_HREF_RE.finditer(m.group(1)):
-                            url = _normalize_hint_url(a.group(1), page_url, seed_origin)
-                            if url and url not in known:
-                                known.add(url); new_urls.append(url)
-                                hits.append({"kind": kind, "url": url, "from": page_url})
-                        continue
-                    url = _normalize_hint_url(m.group(1), page_url, seed_origin)
-                    if url and url not in known:
-                        known.add(url); new_urls.append(url)
-                        hits.append({"kind": kind, "url": url, "from": page_url})
+    summary["hints"] = len(hits)
+    summary["new_urls"] = len(hits)   # 1:1 — `known` dedupes within `_extract_from`
 
-    # Save dedicated artifact + append to katana-out so Stage 2 download_js +
-    # any URL consumers see them.
-    out_path = output_dir / "html-hints.json"
-    with out_path.open("w") as f:
-        for h in hits: f.write(json.dumps(h) + "\n")
-    if new_urls:
+    # Always write the artifact (even when empty — keeps the file shape stable).
+    (output_dir / "html-hints.json").write_text(
+        "".join(json.dumps(h) + "\n" for h in hits), encoding="utf-8")
+
+    if hits:
+        # Append to katana-out for Stage 2 + any URL consumers.
         with katana_out.open("a") as f:
-            for u in new_urls: f.write(u + "\n")
-        # Also append as endpoint records so Stage 5 (live validation) probes
-        # them even when there's no JS-derived endpoints.json — the score URL
-        # behind a meta-refresh / noscript / inline handler will only get HIT
-        # if we actually fetch it.
+            for h in hits: f.write(h["url"] + "\n")
+        # Append as endpoint records so Stage 5 probes them even when JSluice
+        # produced no endpoints.json (HTML-only apps, webpack-stripped bundles).
         ep_path = output_dir / "endpoints.json"
         with ep_path.open("a") as f:
             for h in hits:
                 f.write(json.dumps({
                     "url": h["url"], "queryParams": [], "bodyParams": [],
                     "method": "GET", "type": f"html-hint:{h['kind']}",
-                    "filename": h.get("from", ""),
+                    "filename": h["from"],
                 }) + "\n")
-
-    if new_urls:
-        Log.info(f"    [+] {len(new_urls)} new URL hint(s) from {pages_scanned} HTML page(s) "
-                 f"(meta-refresh / noscript / inline handlers / data-attrs)")
+        Log.info(f"    [+] {len(hits)} new URL hint(s) from {summary['pages_scanned']} "
+                 f"HTML page(s) (meta-refresh / noscript / inline handlers / data-attrs)")
     else:
-        Log.info(f"    [-] No HTML URL hints found in {pages_scanned} page(s)")
-    return {"pages_scanned": pages_scanned, "hints": len(hits), "new_urls": len(new_urls)}
-
-
-def _build_origin(url: str) -> str:
-    try:
-        p = urllib.parse.urlparse(url)
-        return f"{p.scheme}://{p.netloc}"
-    except Exception:
-        return ""
-
-
-def _normalize_hint_url(href: str, page_url: str, seed_origin: str) -> str | None:
-    """Turn a relative href into an absolute URL on the same origin.
-    Drops obvious noise (javascript:, mailto:, #fragments)."""
-    if not href: return None
-    href = href.strip().strip("'\"")
-    low = href.lower()
-    if low.startswith(("javascript:", "mailto:", "tel:", "data:", "blob:")):
-        return None
-    if href.startswith("#"):
-        return None
-    try:
-        abs_url = urllib.parse.urljoin(page_url, href)
-    except Exception:
-        return None
-    # Same-origin only — don't leak third-party hints into the crawl
-    if seed_origin and not abs_url.startswith(seed_origin):
-        return None
-    return abs_url
+        Log.info(f"    [-] No HTML URL hints found in {summary['pages_scanned']} page(s)")
+    return summary
 
 
 def download_js(katana_out, output_dir, headers):
