@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/bin/python3.11
 """
 jspect.py — Automated JavaScript analysis pipeline for web app pentesting.
 
