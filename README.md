@@ -74,7 +74,7 @@ jspect -u https://target.com --profile gentle
 
 ```
 -u URL                 Target URL
---dir PATH             Local source directory (skips crawl)
+--dir PATH             Local source directory (skips crawl) — see below
 -H "Cookie: ..."       Auth header (repeatable)
 --from-burp FILE       Read raw HTTP request from file (or '-' for stdin)
 -o DIR                 Output directory (default: auto-timestamped)
@@ -92,6 +92,30 @@ jspect -u https://app.example.com -H "Cookie: session=..." -H "Authorization: Be
 jspect --from-burp /path/to/burp-request.txt
 pbpaste | jspect --from-burp -                   # macOS — pipe a Burp clipboard
 ```
+
+### Local source folder (`--dir`)
+
+Point it at a source tree or a folder recovered from source maps. It collects
+JS/TS/JSX/Vue files (plus extension-less webpack modules), and also `.json`,
+`.html`, `.yml`, `.map` and `.env` files for secrets and config analysis. Files
+keep their real relative paths under `js-clean/`.
+
+```bash
+jspect --dir ~/src/app                                  # static analysis only
+jspect --dir ~/src/app -u https://app.example.com       # + probe found endpoints live
+jspect --dir ~/src/app --node-modules all               # also analyse public npm packages
+jspect --dir ~/src/app --exclude 'test/*' --exclude '*.spec.js'
+```
+
+- `--node-modules auto` (default) skips well-known public packages (react,
+  lodash, @babel/…) but **keeps unrecognised ones**. Internal or private
+  packages are usually where the interesting code is. Use `all` or `none` to
+  change this.
+- Hashed webpack bundles (`main.<hash>.js`) that sit next to recovered sources
+  are moved to `bundles/`. They are still scanned for endpoints, secrets and
+  vulnerable libraries, but not for comments or SAST, which avoids duplicate
+  findings. Use `--keep-bundles` to analyse them fully.
+- Retire.js scans the original folder, including `node_modules`.
 
 ### Pipe everything through Burp
 
