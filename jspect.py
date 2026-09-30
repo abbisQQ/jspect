@@ -36,12 +36,14 @@ Usage:
 
 import argparse
 import base64
+import fnmatch
 import hashlib
 import json
 import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import ssl
 import subprocess
@@ -2016,6 +2018,281 @@ def discover_nested_js(js_clean, output_dir, headers, target, max_levels=2):
     return dangling_file
 
 
+# ---------- Local directory mode (--dir): source collection ----------
+
+# Everything the JS stages (JSluice, comments, HTTP calls, Semgrep) should read.
+# .ts/.tsx/.vue are parsed error-tolerantly by jsluice and natively by Semgrep.
+JS_LIKE_EXTS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte")
+
+# Non-JS files worth keeping: secrets (TruffleHog), API docs + sensitive keys
+# (Stage 5b JSON analysis), templates (Semgrep html rules).
+LOCAL_EXTRA_EXTS = {
+    ".json", ".html", ".htm", ".map", ".yml", ".yaml", ".xml",
+    ".properties", ".ini", ".conf", ".config", ".toml",
+}
+LOCAL_EXTRA_DOTFILES = re.compile(r"^\.(env(\..+)?|npmrc|yarnrc(\.yml)?|htpasswd)$", re.IGNORECASE)
+LOCAL_MAX_FILE_BYTES = 20 * 1024 * 1024
+
+# Extension-less files that are never JS — don't bother sniffing them.
+_NON_JS_BARE_NAMES = {"license", "licence", "readme", "makefile", "dockerfile",
+                      "changelog", "authors", "notice", "procfile", "copying"}
+_JS_SNIFF_RE = re.compile(
+    r"\b(?:function|var|let|const|import|export|require\s*\(|module\.exports)\b|=>"
+)
+
+NODE_MODULES_MODES = ("auto", "all", "none")
+NODE_MODULES_DEFAULT = "auto"
+
+# Well-known public npm packages / scopes. In --node-modules auto mode these are
+# skipped; anything NOT recognised is treated as first-party (private / internal
+# packages are where the interesting code usually lives). Source-map recovery
+# often strips the '@' from scopes, so bare scope names ("babel") are listed too.
+PUBLIC_NPM_SCOPES = {
+    "babel", "types", "angular", "mui", "material-ui", "emotion", "fortawesome",
+    "popperjs", "reduxjs", "tanstack", "vue", "sentry", "floating-ui", "remix-run",
+    "testing-library", "firebase", "apollo", "nestjs", "nuxt", "svelte", "sveltejs",
+    "ngrx", "ng-bootstrap", "ionic", "capacitor", "headlessui", "heroicons",
+    "radix-ui", "react-aria", "stripe", "googlemaps", "microsoft", "aws-sdk",
+    "azure", "datadog", "fullcalendar", "ckeditor", "tinymce", "formatjs",
+    "webassemblyjs", "xtuc", "jridgewell", "swc", "esbuild", "rollup", "vitejs",
+    "hot-loader", "lit", "polymer", "webcomponents", "stencil", "glimmer", "ember",
+}
+PUBLIC_NPM_PACKAGES = {
+    # React / Redux ecosystem
+    "react", "react-dom", "react-is", "react-router", "react-router-dom", "redux",
+    "react-redux", "redux-thunk", "redux-saga", "reselect", "immer", "scheduler",
+    "prop-types", "hoist-non-react-statics", "history", "classnames", "clsx",
+    "styled-components", "mobx", "recoil", "zustand", "use-sync-external-store",
+    # Angular / Vue / others
+    "angular", "rxjs", "zone.js", "tslib", "vue", "vuex", "vue-router", "svelte",
+    "knockout", "knockout.validation", "backbone", "underscore", "ember-source",
+    "preact", "lit", "lit-html", "lit-element", "jquery", "jquery-ui",
+    # Utilities
+    "lodash", "lodash-es", "moment", "moment-timezone", "dayjs", "date-fns",
+    "luxon", "uuid", "nanoid", "axios", "whatwg-fetch", "unfetch", "promise",
+    "asap", "core-js", "core-js-pure", "regenerator-runtime", "object-assign",
+    "invariant", "tiny-invariant", "warning", "tiny-warning", "fbjs", "isarray",
+    "symbol-observable", "setimmediate", "timers-browserify", "process", "buffer",
+    "events", "util", "path-browserify", "path-to-regexp", "resolve-pathname",
+    "value-equal", "shallowequal", "deepmerge", "qs", "query-string",
+    "querystring-es3", "url", "punycode", "base64-js", "ieee754", "inherits",
+    "safe-buffer", "debug", "ms", "eventemitter3", "tslib", "js-cookie",
+    "dompurify", "marked", "highlight.js", "prismjs", "d3", "chart.js", "three",
+    "leaflet", "mapbox-gl", "bootstrap", "popper.js", "tinymce", "quill",
+    "ckeditor", "codemirror", "monaco-editor", "socket.io-client", "i18next",
+    "react-i18next", "intl", "numeral", "crypto-js", "jwt-decode", "jsonwebtoken",
+    "yup", "formik", "joi", "ajv", "zod", "graphql", "graphql-tag",
+    # Build tooling that leaks into bundles
+    "webpack", "babel-runtime", "css-loader", "style-loader", "vite",
+    "html-webpack-plugin", "react-scripts", "react-app-polyfill", "raf",
+}
+PUBLIC_NPM_PREFIXES = ("react-", "rc-", "redux-", "vue-", "ng-", "d3-", "lodash.",
+                       "babel-", "webpack-", "core-js", "moment-", "@babel/",
+                       "@types/", "ember-", "jquery.", "jquery-", "eslint")
+
+
+def _is_public_npm_package(name: str) -> bool:
+    """True if `name` (e.g. "react", "@babel/runtime", "babel") looks like a
+    well-known public npm package."""
+    bare = name.lstrip("@").lower()
+    scope = bare.split("/", 1)[0]
+    if bare in PUBLIC_NPM_PACKAGES or scope in PUBLIC_NPM_SCOPES:
+        return True
+    return name.lower().startswith(PUBLIC_NPM_PREFIXES) or bare.startswith(PUBLIC_NPM_PREFIXES)
+
+
+def _looks_like_js(path: Path) -> bool:
+    """Sniff an extension-less file (e.g. webpack's 'bootstrap <hash>' module)."""
+    if path.name.lower() in _NON_JS_BARE_NAMES:
+        return False
+    try:
+        with path.open("rb") as f:
+            head = f.read(4096)
+    except OSError:
+        return False
+    if not head or b"\0" in head:
+        return False
+    text = head.decode("utf-8", errors="ignore")
+    return len(_JS_SNIFF_RE.findall(text)) >= 2
+
+
+# Hashed build outputs: main.1a2b3c4d.js, 2.a1b2c3d4.chunk.js, vendor-4f3e2a1b.js
+_HASHED_BUNDLE_RE = re.compile(r"[.\-_][0-9a-f]{8,}(?:\.chunk)?\.js$", re.IGNORECASE)
+_BUNDLE_MARKERS = ("webpackBootstrap", "webpackJsonp", "__webpack_require__",
+                   "webpackChunk", "/******/")
+# Only treat bundles as duplicates when there's a real source tree next to them.
+LOCAL_MIN_SOURCES_FOR_BUNDLE_SKIP = 5
+
+
+def _is_duplicate_bundle(path: Path) -> bool:
+    """A hashed webpack bundle — when recovered sources sit alongside it, its
+    contents duplicate them and every finding would be reported twice."""
+    if not _HASHED_BUNDLE_RE.search(path.name):
+        return False
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            head = f.read(65536)
+    except OSError:
+        return False
+    return any(m in head for m in _BUNDLE_MARKERS)
+
+
+def _matches_any(rel: str, patterns) -> bool:
+    return any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(rel + "/", p) for p in patterns)
+
+
+def collect_local_sources(src_root: Path, dest: Path, bundles_dest: Path,
+                          node_modules: str = NODE_MODULES_DEFAULT,
+                          excludes=(), keep_bundles: bool = False) -> dict:
+    """Copy the analysable parts of a local source tree into `dest`, keeping the
+    original relative paths (so findings point at real files and names can't
+    collide). Returns counters describing what was kept and skipped.
+
+    node_modules: "auto" → skip well-known public packages, keep unknown ones
+                  (internal/private packages); "all" → keep everything;
+                  "none" → skip node_modules entirely.
+    """
+    excludes = list(excludes or [])
+    js_files, extra_files = [], []          # [(src, rel_dest)]
+    first_party_pkgs, public_pkgs = set(), set()
+    skipped = {"hidden": 0, "excluded": 0, "large": 0, "empty": 0, "other_ext": 0,
+               "declaration": 0}
+    other_exts = {}
+
+    for dirpath, dirnames, filenames in os.walk(src_root):
+        here = Path(dirpath)
+        rel_dir = here.relative_to(src_root)
+
+        # Prune directories in place so os.walk never descends into them.
+        keep = []
+        for d in sorted(dirnames):
+            rel_d = (rel_dir / d).as_posix()
+            if d.startswith("."):
+                continue
+            if excludes and _matches_any(rel_d, excludes):
+                skipped["excluded"] += 1
+                continue
+            if d == "node_modules" and node_modules == "none":
+                public_pkgs.add("node_modules/*")
+                continue
+            if here.name == "node_modules" and not d.startswith("@"):
+                if node_modules == "auto" and _is_public_npm_package(d):
+                    public_pkgs.add(d)
+                    continue
+                first_party_pkgs.add(d)
+            elif here.parent.name == "node_modules" and here.name.startswith("@"):
+                pkg = f"{here.name}/{d}"
+                if node_modules == "auto" and _is_public_npm_package(pkg):
+                    public_pkgs.add(pkg)
+                    continue
+                first_party_pkgs.add(pkg)
+            keep.append(d)
+        dirnames[:] = keep
+
+        for fname in sorted(filenames):
+            src = here / fname
+            rel = rel_dir / fname
+            if excludes and _matches_any(rel.as_posix(), excludes):
+                skipped["excluded"] += 1
+                continue
+            if src.is_symlink() or not src.is_file():
+                continue
+            try:
+                size = src.stat().st_size
+            except OSError:
+                continue
+            if size == 0:
+                skipped["empty"] += 1
+                continue
+            if size > LOCAL_MAX_FILE_BYTES:
+                skipped["large"] += 1
+                continue
+
+            suffix = src.suffix.lower()
+            if fname.startswith("."):
+                if LOCAL_EXTRA_DOTFILES.match(fname):
+                    extra_files.append((src, rel))
+                else:
+                    skipped["hidden"] += 1
+            elif fname.endswith(".d.ts"):
+                skipped["declaration"] += 1
+            elif suffix in JS_LIKE_EXTS:
+                js_files.append((src, rel))
+            elif suffix in LOCAL_EXTRA_EXTS:
+                extra_files.append((src, rel))
+            elif not suffix and _looks_like_js(src):
+                # Give it a .js suffix so every downstream tool treats it as JS.
+                js_files.append((src, rel.with_name(rel.name + ".js")))
+            else:
+                skipped["other_ext"] += 1
+                key = suffix or "(none)"
+                other_exts[key] = other_exts.get(key, 0) + 1
+
+    # Hashed webpack bundles duplicate the recovered sources next to them —
+    # move them aside (TruffleHog + Retire.js still scan them).
+    bundles = []
+    if not keep_bundles:
+        candidates = [(s, r) for s, r in js_files if _is_duplicate_bundle(s)]
+        if candidates and len(js_files) - len(candidates) >= LOCAL_MIN_SOURCES_FOR_BUNDLE_SKIP:
+            bundles = candidates
+            bundle_set = {s for s, _ in candidates}
+            js_files = [(s, r) for s, r in js_files if s not in bundle_set]
+
+    def _copy(pairs, root):
+        for src, rel in pairs:
+            out = root / rel
+            out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(src, out)
+            except OSError as e:
+                Log.debug(f"copy failed for {src}: {e}")
+
+    dest.mkdir(parents=True, exist_ok=True)
+    _copy(js_files, dest)
+    _copy(extra_files, dest)
+    if bundles:
+        _copy(bundles, bundles_dest)
+
+    return {
+        "js": len(js_files),
+        "extra": len(extra_files),
+        "extra_by_ext": _count_by_ext(r for _, r in extra_files),
+        "bundles": [r.as_posix() for _, r in bundles],
+        "first_party_pkgs": sorted(first_party_pkgs),
+        "public_pkgs": sorted(public_pkgs),
+        "skipped": skipped,
+        "other_exts": other_exts,
+    }
+
+
+def _count_by_ext(rels) -> dict:
+    counts = {}
+    for r in rels:
+        key = r.suffix.lower() or r.name
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _short_list(items, limit: int = 6) -> str:
+    items = list(items)
+    more = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+    return ", ".join(items[:limit]) + more
+
+
+_GENERIC_DIR_NAMES = {"output", "out", "src", "source", "sources", "dist", "build",
+                      "app", "code", "js", "static", "public", "www", "web", "client",
+                      "frontend", "tmp", "temp", "extracted", "recovered", "files"}
+
+
+def iter_js_files(root: Path) -> list:
+    """Every JS-like file under `root` (recursive). In URL mode js-clean/ is flat,
+    so this matches the old glob("*.js"); in --dir mode it walks the mirrored tree."""
+    return sorted(
+        p for p in root.rglob("*")
+        if p.suffix.lower() in JS_LIKE_EXTS and not p.name.endswith(".d.ts") and p.is_file()
+    )
+
+
 # ---------- Stage 2c: Beautify minified JS ----------
 
 def beautify_js(js_clean):
@@ -2040,7 +2317,7 @@ def beautify_js(js_clean):
     opts.preserve_newlines = True
     opts.max_preserve_newlines = 2
 
-    js_files = list(js_clean.glob("*.js"))
+    js_files = [p for p in iter_js_files(js_clean) if p.suffix.lower() in (".js", ".mjs", ".cjs")]
     if not js_files:
         Log.info("    [-] No JS files to beautify")
         return
@@ -2236,13 +2513,57 @@ def recover_source_maps(js_clean, output_dir, available_tools, target, headers):
 
 # ---------- Stage 4: JSluice ----------
 
-def run_jsluice(target_dir, output_dir):
+_TEMPLATE_LITERAL_RE = re.compile(r"`([^`\s<>]{2,300})`")
+_TEMPLATE_EXPR_RE = re.compile(r"\$\{[^}]*\}")
+
+
+def _template_literal_endpoints(js_files, known: set) -> list:
+    """jsluice ignores ES6 template literals like `/api/items?id=${id}` — only the
+    Babel-transpiled form ("/api/items?id=" + id) gets picked up. Un-transpiled
+    sources (--dir trees, recovered source maps) need this extra pass.
+    Emits jsluice-shaped records with ${...} replaced by EXPR, like jsluice does."""
+    records = []
+    for path in js_files:
+        try:
+            content = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for m in _TEMPLATE_LITERAL_RE.finditer(content):
+            raw = m.group(1)
+            if "${" not in raw or "/" not in raw:
+                continue    # plain literals are already covered by jsluice
+            url = _TEMPLATE_EXPR_RE.sub("EXPR", raw)
+            if "$" in url or "{" in url or "}" in url:
+                continue    # nested template / unbalanced braces
+            # Must carry some real path text, not just EXPR/EXPR
+            if len(re.sub(r"EXPR|[^A-Za-z]", "", url)) < 2:
+                continue
+            if not (url.startswith(("/", "http://", "https://", "//", "EXPR/"))
+                    or re.match(r"^[\w.-]+/", url)):
+                continue
+            if (url, path) in known:
+                continue
+            known.add((url, path))
+            query = urlparse(url).query
+            records.append({
+                "url": url,
+                "queryParams": [k for k in urllib.parse.parse_qs(query, keep_blank_values=True)],
+                "bodyParams": [], "method": "", "type": "templateLiteral",
+                "filename": path,
+            })
+    return records
+
+
+def run_jsluice(target_dir, output_dir, extra_dirs=()):
+    """extra_dirs: also extract endpoints from these (e.g. --dir mode's set-aside
+    bundles — transpiled code sometimes exposes URLs the sources hide)."""
     stage_header(4, "JSluice (endpoints + secrets)")
     endpoints_json = output_dir / "endpoints.json"
     secrets_json = output_dir / "secrets.json"
 
-    # rglob already covers everything — using both glob+rglob double-counted top-level files
-    js_files = sorted({str(p) for p in target_dir.rglob("*.js")})
+    # Recursive + every JS-like extension (.jsx/.ts/.vue from source maps or --dir trees)
+    js_files = [str(p) for d in (target_dir, *extra_dirs) if Path(d).is_dir()
+                for p in iter_js_files(Path(d))]
     if not js_files:
         Log.warn("No JS files to analyse")
         return None, None
@@ -2267,6 +2588,20 @@ def run_jsluice(target_dir, output_dir):
 
     jsluice_run("urls", endpoints_json)
     jsluice_run("secrets", secrets_json)
+
+    known = set()
+    for line in endpoints_json.open(encoding="utf-8", errors="replace"):
+        try:
+            rec = json.loads(line)
+            known.add((rec.get("url"), rec.get("filename")))
+        except Exception:
+            continue
+    tl_records = _template_literal_endpoints(js_files, known)
+    if tl_records:
+        with endpoints_json.open("a", encoding="utf-8") as f:
+            for rec in tl_records:
+                f.write(json.dumps(rec) + "\n")
+        Log.verbose(f"added {len(tl_records)} template-literal endpoint(s) jsluice skips")
 
     # Filter out non-endpoint noise that jsluice's stringLiteral extractor picks up:
     # webpack module imports (`./auth/index.js`), source-map internal schemes
@@ -2508,12 +2843,28 @@ SENSITIVE_JSON_KEYS = re.compile(
 )
 
 
-def static_metadata_analysis(js_clean, output_dir, target, headers):
+_JS_JSON_WRAPPER_RE = re.compile(r"^\s*(?:module\.exports\s*=|export\s+default)\s*")
+
+
+def _unwrap_js_json(text: str) -> str:
+    """Webpack's json-loader output (recovered from source maps) is
+    `module.exports = {...}` rather than plain JSON — strip the wrapper."""
+    text = text.lstrip("\ufeff")
+    m = _JS_JSON_WRAPPER_RE.match(text)
+    if m:
+        text = text[m.end():].rstrip().rstrip(";")
+    return text
+
+
+def static_metadata_analysis(js_clean, output_dir, target, headers, local_json_root=None):
     """
     Three static analyses on the JS corpus:
       1. Source map exposure findings
       2. JSON file discovery (Swagger/OpenAPI, config files, sensitive keys)
       3. Developer comments (TODO/FIXME, internal URLs, credential mentions)
+
+    local_json_root: in --dir mode, analyse the *.json files under this directory
+    directly instead of probing JSON URLs on the target.
     """
     stage_header("5b", "Static metadata analysis (maps, JSON, comments)")
 
@@ -2534,7 +2885,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
 
     sources_dir = output_dir / "sources"
 
-    for jsfile in js_clean.glob("*.js"):
+    for jsfile in iter_js_files(js_clean):
         try:
             content = jsfile.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -2586,7 +2937,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
                 continue  # out of scope
 
             status, body = fetch(map_url)
-            entry = {"url": map_url, "status": status, "source_file": jsfile.name}
+            entry = {"url": map_url, "status": status, "source_file": jsfile.relative_to(js_clean).as_posix()}
             if status == 200 and body.strip().startswith(("{", "[")):
                 sources_dir.mkdir(exist_ok=True)
                 h = hashlib.sha1(map_url.encode()).hexdigest()[:8]
@@ -2670,7 +3021,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
         r"""['"`]([^'"`\s<>{}()]+?\.json(?:\?[^'"`\s<>]*)?)['"`]""",
         re.IGNORECASE,
     )
-    for jsfile in js_clean.glob("*.js"):
+    for jsfile in iter_js_files(js_clean):
         try:
             content = jsfile.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -2706,13 +3057,26 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
     for p in well_known:
         json_refs.add(target_base + p)
 
-    Log.verbose(f"probing {len(json_refs)} JSON URL(s)")
+    def _remote_json_sources():
+        Log.verbose(f"probing {len(json_refs)} JSON URL(s)")
+        for ref_url in json_refs:
+            yield (ref_url, *fetch(ref_url))
+
+    def _local_json_sources():
+        json_paths = sorted(p for p in local_json_root.rglob("*.json") if p.is_file())
+        Log.verbose(f"reading {len(json_paths)} local JSON file(s)")
+        for p in json_paths:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            yield p.relative_to(local_json_root).as_posix(), 200, _unwrap_js_json(text)
 
     json_findings = []   # [{url, status, type, sensitive_keys, swagger_endpoints}]
     swagger_endpoints = []  # endpoints discovered from Swagger docs
 
-    for url in json_refs:
-        status, body = fetch(url)
+    json_sources = _local_json_sources() if local_json_root else _remote_json_sources()
+    for url, status, body in json_sources:
         if status != 200 or not body.strip():
             continue
         if not body.strip().startswith(("{", "[")):
@@ -2800,7 +3164,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
     comment_findings = []
     seen_lines = set()  # dedupe identical comments across files
 
-    for jsfile in js_clean.glob("*.js"):
+    for jsfile in iter_js_files(js_clean):
         try:
             content = jsfile.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -2826,7 +3190,7 @@ def static_metadata_analysis(js_clean, output_dir, target, headers):
                 comment_findings.append({
                     "kind": kind,
                     "text": text,
-                    "file": jsfile.name,
+                    "file": jsfile.relative_to(js_clean).as_posix(),
                     "line": line_num,
                 })
 
@@ -3914,7 +4278,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
     secrets    = []         # [{kind, match, file, line}]
     seen_secrets = set()    # deduplicate by (kind, truncated value)
 
-    js_files = sorted(js_clean.glob("*.js"))
+    js_files = iter_js_files(js_clean)
     Log.verbose(f"scanning {len(js_files)} JS files")
 
     for jsfile in js_files:
@@ -3956,7 +4320,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
                     "kind":   kind,
                     "method": method,
                     "url":    url[:300],
-                    "file":   jsfile.name,
+                    "file":   jsfile.relative_to(js_clean).as_posix(),
                     "line":   line_no,
                 })
 
@@ -3994,7 +4358,7 @@ def extract_http_calls_and_secrets(js_clean, output_dir):
                     "kind":    kind,
                     "match":   display,
                     "raw_len": len(val),
-                    "file":    jsfile.name,
+                    "file":    jsfile.relative_to(js_clean).as_posix(),
                     "line":    line_no,
                 })
 
@@ -4934,8 +5298,11 @@ def run_semgrep(target_dir, output_dir, available_tools):
         if other_errors:
             def _is_parse_error(e):
                 t = e.get("type")
-                return (t == "Syntax error"
-                        or (isinstance(t, list) and t and t[0] in ("PartialParsing", "Syntax error")))
+                t0 = t[0] if isinstance(t, list) and t else t
+                # "Syntax error", "Other syntax error" (e.g. .html templates in
+                # --dir trees), "PartialParsing"
+                return isinstance(t0, str) and ("syntax error" in t0.lower()
+                                                or t0 == "PartialParsing")
 
             syntax_errors = [e for e in other_errors if _is_parse_error(e)]
             config_errors = [e for e in other_errors if not _is_parse_error(e)]
@@ -4959,8 +5326,27 @@ def run_semgrep(target_dir, output_dir, available_tools):
 
 # ---------- Stage 7: Retire.js ----------
 
-def run_retire(target_dir, output_dir):
-    stage_header(7, "Retire.js (known-vulnerable libraries)")
+def _retire_summary(entries):
+    """(libraries, vulnerable libraries, unique vulns) — deduplicated by
+    component@version, so the same library found in node_modules AND a bundle
+    isn't counted twice."""
+    libs, affected, vulns = set(), set(), set()
+    for entry in entries:
+        for r in entry.get("results", []):
+            lib = f"{r.get('component')}@{r.get('version')}"
+            libs.add(lib)
+            for v in r.get("vulnerabilities") or []:
+                affected.add(lib)
+                vulns.add((lib, json.dumps(v.get("identifiers"), sort_keys=True)))
+    return libs, affected, vulns
+
+
+def run_retire(target_dir, output_dir, fallback_dir=None, ignore=(), _header=True):
+    """fallback_dir: rescan this (smaller) directory if the first scan times out —
+    used in --dir mode, where target_dir is the whole original tree incl. node_modules.
+    ignore: paths for retire to skip (e.g. our own output dir inside target_dir)."""
+    if _header:
+        stage_header(7, "Retire.js (known-vulnerable libraries)")
     output_file = output_dir / "retire.json"
 
     cmd = [
@@ -4970,10 +5356,16 @@ def run_retire(target_dir, output_dir):
         "--outputpath", str(output_file),
         "--deep",   # content-hash fingerprinting in addition to filename/version matching
     ]
+    if ignore:
+        cmd += ["--ignore", ",".join(str(p) for p in ignore)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=RETIRE_TIMEOUT)
     except subprocess.TimeoutExpired:
         Log.warn(f"Retire.js timed out after {RETIRE_TIMEOUT}s (large corpus or slow DB fetch)")
+        if fallback_dir:
+            Log.info(f"    {C.DIM}↳ retrying on the collected sources only ({fallback_dir}){C.RESET}")
+            output_file.unlink(missing_ok=True)
+            return run_retire(fallback_dir, output_dir, _header=False)
         return None
 
     # Surface any stderr output (DB-fetch errors, SSL issues, etc.)
@@ -5009,16 +5401,8 @@ def run_retire(target_dir, output_dir):
                 Log.warn(f"  first error: {str(db_errors[0])[:160]}")
                 return output_file  # still return — partial info better than none
 
-        vuln_count = 0
-        lib_count = 0
-        affected_libs = set()
-        for entry in entries:
-            for r in entry.get("results", []):
-                lib_count += 1
-                vulns = r.get("vulnerabilities") or []
-                if vulns:
-                    affected_libs.add(f"{r.get('component')}@{r.get('version')}")
-                    vuln_count += len(vulns)
+        libs, affected_libs, unique_vulns = _retire_summary(entries)
+        lib_count, vuln_count = len(libs), len(unique_vulns)
 
         if lib_count == 0:
             Log.warn(
@@ -5040,14 +5424,15 @@ def run_retire(target_dir, output_dir):
 
 # ---------- Stage 8: TruffleHog ----------
 
-def run_trufflehog(target_dir, output_dir, available_tools, verify):
+def run_trufflehog(target_dir, output_dir, available_tools, verify, extra_paths=()):
     stage_header(8, "TruffleHog")
     if not available_tools.get("trufflehog"):
         Log.info("    [-] trufflehog not installed, skipping")
         return None
 
     th_json = output_dir / "trufflehog.json"
-    cmd = ["trufflehog", "filesystem", str(target_dir), "--json"]
+    cmd = ["trufflehog", "filesystem", str(target_dir),
+           *(str(p) for p in extra_paths if Path(p).exists()), "--json"]
     if verify:
         cmd.append("--only-verified")
         Log.warn("--verify-secrets enabled — making real API calls to detected services")
@@ -6663,7 +7048,7 @@ document.querySelectorAll('.copy-btn').forEach(function(btn) {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wiz_print_banner_header() -> None:
-    print(BANNER)
+    # main() already printed BANNER — just the wizard heading here
     print(f"{C.BOLD}{C.CYAN}Interactive setup{C.RESET}  ·  press Ctrl+C to abort\n")
 
 
@@ -6727,51 +7112,135 @@ def _wiz_ask_headers() -> list:
 
 def _wiz_equivalent_cli(args) -> str:
     """Build the CLI you'd type to repeat this scan without the wizard."""
+    q = shlex.quote
     parts = ["jspect"]
     if args.url:
-        parts.append(f"-u {args.url}")
+        parts.append(f"-u {q(args.url)}")
     if args.dir:
-        parts.append(f"--dir {args.dir}")
+        parts.append(f"--dir {q(args.dir)}")
+        if args.node_modules != NODE_MODULES_DEFAULT:
+            parts.append(f"--node-modules {args.node_modules}")
+        for g in args.exclude or []:
+            parts.append(f"--exclude {q(g)}")
+        if args.keep_bundles:
+            parts.append("--keep-bundles")
     for h in args.header or []:
-        parts.append(f'-H "{h}"')
-    if args.profile != PROFILE_DEFAULT:
+        parts.append(f"-H {q(h)}")
+    # Profile only tunes crawling/probing — noise in a pure --dir command
+    if args.profile != PROFILE_DEFAULT and args.url:
         parts.append(f"--profile {args.profile}")
     if args.proxy:
-        parts.append(f"--proxy {args.proxy}")
+        parts.append(f"--proxy {q(args.proxy)}")
     if args.proxy_insecure:
         parts.append("--proxy-insecure")
-    if args.ajax_fill_forms and args.ajax_fill_forms != "off":
+    if args.ajax_fill_forms and args.ajax_fill_forms != "off" and not args.dir:
         parts.append(f"--ajax-fill-forms {args.ajax_fill_forms}")
     if args.output:
-        parts.append(f"-o {args.output}")
+        parts.append(f"-o {q(args.output)}")
     return " ".join(parts)
+
+
+def _wiz_local_path(target: str):
+    """Return a Path if `target` is meant as a local path (absolute, ~, ./, ../,
+    file://, or anything that exists on disk), else None."""
+    raw = target.removeprefix("file://")
+    if raw.startswith(("/", "~", "./", "../")) or Path(raw).expanduser().exists():
+        return Path(raw).expanduser()
+    return None
+
+
+def _wiz_ask_proxy(args, step: str) -> None:
+    print(f"  {C.BOLD}{step}{C.RESET} Proxy (optional)")
+    proxy = _wiz_ask(
+        "  Proxy URL (Burp/mitmproxy/Tor) — Enter to skip:",
+        default=args.proxy or "",
+    )
+    if proxy:
+        args.proxy = proxy
+        # Burp ships a self-signed CA → enable insecure mode automatically
+        if "127.0.0.1" in proxy or "host.docker.internal" in proxy:
+            args.proxy_insecure = True
+            print(f"    {C.DIM}↳ enabling --proxy-insecure (self-signed CA assumed){C.RESET}")
+    print()
+
+
+def _wiz_local_dir_steps(args) -> None:
+    """Questions that matter for --dir: what to collect, and optional live probing."""
+    # [2/4] node_modules handling
+    print(f"  {C.BOLD}[2/4]{C.RESET} node_modules")
+    print(f"  {C.DIM}auto = skip well-known public packages (react, lodash…), keep unknown / "
+          f"internal ones{C.RESET}")
+    args.node_modules = _wiz_ask_choice(
+        "  Which node_modules packages to analyse:",
+        choices=list(NODE_MODULES_MODES),
+        default=args.node_modules or NODE_MODULES_DEFAULT,
+    )
+    print()
+
+    # [3/4] excludes
+    print(f"  {C.BOLD}[3/4]{C.RESET} Exclusions (optional)")
+    raw = _wiz_ask(
+        "  Globs to skip, relative to the folder (e.g. test/* *.spec.js) — Enter for none:",
+        default=" ".join(args.exclude or []),
+    )
+    args.exclude = shlex.split(raw) if raw else []
+    print()
+
+    # [4/4] live probing — the only reason to ask for auth / proxy in dir mode
+    print(f"  {C.BOLD}[4/4]{C.RESET} Live endpoint probing (optional)")
+    base = _wiz_ask(
+        "  Base URL of the running app to probe discovered endpoints against — Enter to skip:",
+        default=args.url or "",
+    )
+    if base:
+        if not base.startswith(("http://", "https://")):
+            base = "https://" + base
+        args.url = base
+        print()
+        print(f"  {C.BOLD}[4a]{C.RESET} Authentication for probing (optional)")
+        new_headers = _wiz_ask_headers()
+        if new_headers:
+            args.header = (args.header or []) + new_headers
+        print()
+        _wiz_ask_proxy(args, "[4b]")
+    else:
+        print(f"    {C.DIM}↳ static analysis only (no network requests to the app){C.RESET}\n")
 
 
 def interactive_setup(args) -> None:
     """Walk the user through the minimum questions to start a scan. Mutates the
     passed `args` Namespace in place.
 
-    Only 5 questions, all with defaults — Enter accepts the suggestion. Calls
-    `apply_profile()` again afterwards in case the user changed the profile.
+    URL targets get 5 questions (target, auth, profile, proxy, forms); local
+    folders get 4 (target, node_modules, excludes, optional live probing). All
+    have defaults — Enter accepts the suggestion.
     """
     _wiz_print_banner_header()
 
-    # [1/5] target — accepts URL, local path, OR a path to a Burp request file
-    print(f"  {C.BOLD}[1/5]{C.RESET} Target")
+    # [1] target — accepts URL, local path, OR a path to a Burp request file
+    print(f"  {C.BOLD}[1]{C.RESET} Target")
     print(f"  {C.DIM}Tip: prefix with 'burp:' to paste a raw HTTP request "
           f"(e.g. burp:/tmp/req.txt) — URL + cookies + headers auto-extracted.{C.RESET}")
-    target = _wiz_ask(
-        "  URL to scan, local path, or burp:FILE:",
-        default=args.url or args.dir or "",
-        required=True,
-    )
+    while True:
+        target = _wiz_ask(
+            "  URL to scan, local folder, or burp:FILE:",
+            default=args.url or args.dir or "",
+            required=True,
+        )
+        local = None if target.startswith("burp:") else _wiz_local_path(target)
+        if local is not None and not local.is_dir():
+            what = "is a file, not a folder" if local.exists() else "does not exist"
+            print(f"    {C.RED}✗{C.RESET} {local} {what} — try again")
+            continue
+        break
+
     if target.startswith("burp:"):
         burp_path = target[len("burp:"):].strip()
         if not burp_path:
             print(f"    {C.YELLOW}empty path after 'burp:' — falling back to manual entry{C.RESET}")
         else:
             try:
-                raw = Path(burp_path).read_text(encoding="utf-8", errors="replace")
+                raw = Path(burp_path).expanduser().read_text(encoding="utf-8", errors="replace")
                 parsed = _parse_raw_http_request(raw)
                 args.url = parsed["url"]
                 args.header = parsed["headers"] + (args.header or [])
@@ -6781,10 +7250,10 @@ def interactive_setup(args) -> None:
             except (OSError, ValueError) as exc:
                 print(f"    {C.RED}✗{C.RESET} parse failed: {exc}")
                 sys.exit(1)
-    elif target.startswith(("file://", "/")) or Path(target).is_dir():
-        # Treat as local source directory
-        args.dir = target.replace("file://", "")
-        args.url = args.url or None
+    elif local is not None:
+        args.dir = str(local)
+        args.url = None
+        print(f"    {C.GREEN}✓{C.RESET} local folder → static analysis mode")
     else:
         # Treat as URL — accept bare hostname and add https://
         if not target.startswith(("http://", "https://")):
@@ -6792,6 +7261,25 @@ def interactive_setup(args) -> None:
         args.url = target
     print()
 
+    if args.dir:
+        _wiz_local_dir_steps(args)
+    else:
+        _wiz_url_steps(args)
+
+    # Show equivalent CLI + confirm
+    print(f"{C.BOLD}{C.CYAN}─" * 60 + C.RESET)
+    print(f"{C.BOLD}Equivalent CLI:{C.RESET}")
+    print(f"  {C.GREEN}{_wiz_equivalent_cli(args)}{C.RESET}")
+    print()
+    confirm = _wiz_ask("Run now? (Y/n)", default="Y")
+    if confirm.lower() not in ("y", "yes", ""):
+        print(f"  {C.YELLOW}aborted{C.RESET}")
+        sys.exit(0)
+    print()
+
+
+def _wiz_url_steps(args) -> None:
+    """Remaining questions for a URL target: auth, profile, proxy, form handling."""
     # [2/5] auth — skipped if a Burp request already supplied headers
     print(f"  {C.BOLD}[2/5]{C.RESET} Authentication (optional)")
     if args.header:
@@ -6809,21 +7297,18 @@ def interactive_setup(args) -> None:
         choices=list(PROFILES),
         default=args.profile or PROFILE_DEFAULT,
     )
+    # Re-apply profile in case it changed. Reset every profile-managed flag back
+    # to None first so the new profile values actually take effect (apply_profile
+    # only overwrites None/[]). Done BEFORE the form question so the answer to
+    # [5/5] isn't overwritten by the profile's ajax_fill_forms value.
+    for key in PROFILES.get(args.profile, {}):
+        if hasattr(args, key):
+            setattr(args, key, None)
+    apply_profile(args, args.profile)
     print()
 
     # [4/5] proxy
-    print(f"  {C.BOLD}[4/5]{C.RESET} Proxy (optional)")
-    proxy = _wiz_ask(
-        "  Proxy URL (Burp/mitmproxy/Tor) — Enter to skip:",
-        default=args.proxy or "",
-    )
-    if proxy:
-        args.proxy = proxy
-        # Burp ships a self-signed CA → enable insecure mode automatically
-        if "127.0.0.1" in proxy or "host.docker.internal" in proxy:
-            args.proxy_insecure = True
-            print(f"    {C.DIM}↳ enabling --proxy-insecure (self-signed CA assumed){C.RESET}")
-    print()
+    _wiz_ask_proxy(args, "[4/5]")
 
     # [5/5] form-fill mode (only matters with AJAX spider on — profile decides that)
     spider_active = (PROFILES.get(args.profile) or {}).get("ajax_spider", False)
@@ -6836,25 +7321,6 @@ def interactive_setup(args) -> None:
         )
     else:
         print(f"  {C.DIM}[5/5]{C.RESET} {C.DIM}Form handling — skipped (AJAX spider off in this profile){C.RESET}")
-    print()
-
-    # Re-apply profile in case --profile changed during interaction. Reset
-    # every profile-managed flag back to None first so the new profile values
-    # actually take effect (apply_profile only overwrites None/[]).
-    for key in PROFILES.get(args.profile, {}):
-        if hasattr(args, key):
-            setattr(args, key, None)
-    apply_profile(args, args.profile)
-
-    # Show equivalent CLI + confirm
-    print(f"{C.BOLD}{C.CYAN}─" * 60 + C.RESET)
-    print(f"{C.BOLD}Equivalent CLI:{C.RESET}")
-    print(f"  {C.GREEN}{_wiz_equivalent_cli(args)}{C.RESET}")
-    print()
-    confirm = _wiz_ask("Run now? (Y/n)", default="Y")
-    if confirm.lower() not in ("y", "yes", ""):
-        print(f"  {C.YELLOW}aborted{C.RESET}")
-        sys.exit(0)
     print()
 
 
@@ -7710,9 +8176,16 @@ code {{ background:#171a21; padding:2px 6px; border-radius:3px; }}
                     "<p><a href='/'>← back</a></p>", 400)
                 return
 
+            local_target = _wiz_local_path(target)
+            if local_target is not None and not local_target.is_dir():
+                self._send_html(
+                    f"<h1>Not a folder</h1><p style='font-family:monospace'>"
+                    f"{html_escape(str(local_target))}</p>"
+                    "<p><a href='/'>← back</a></p>", 400)
+                return
             args_dict = {
-                "url":    target if not target.startswith("/") else "",
-                "dir":    target if target.startswith("/") else "",
+                "url":    target if local_target is None else "",
+                "dir":    str(local_target) if local_target is not None else "",
                 "header": headers,
                 "profile": (form.get("profile", ["default"])[0] or "default"),
                 "proxy":   (form.get("proxy", [""])[0] or "").strip() or None,
@@ -7836,6 +8309,19 @@ def main():
     modes.add_argument("--rules-path", action="store_true",
                        help="Print the path to your user-rules YAML and exit. "
                             "Add custom Semgrep rules there to extend the defaults.")
+
+    # ── Local directory mode ──────────────────────────────────────────────────
+    local_grp = parser.add_argument_group("Local directory (--dir)")
+    local_grp.add_argument("--node-modules", choices=NODE_MODULES_MODES,
+                           default=NODE_MODULES_DEFAULT, metavar="MODE",
+                           help="auto = skip well-known public packages, keep unknown/internal "
+                                "ones (default) | all | none")
+    local_grp.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                           help="Skip paths matching GLOB, relative to --dir "
+                                "(e.g. 'test/*', '*.spec.js'). Repeatable.")
+    local_grp.add_argument("--keep-bundles", action="store_true", default=False,
+                           help="Analyse hashed webpack bundles even when recovered "
+                                "sources sit next to them (duplicates findings)")
 
     # ── Advanced (override profile values — hidden from default help) ─────────
     # We add these to a group named "Advanced" so they appear if the user asks
@@ -7974,6 +8460,8 @@ def main():
             os.environ["CURL_CA_BUNDLE"]    = ""
             os.environ["REQUESTS_CA_BUNDLE"] = ""
 
+    if args.dir:
+        args.dir = str(Path(args.dir.removeprefix("file://")).expanduser())
     if args.dir and not Path(args.dir).is_dir():
         parser.error(f"--dir path does not exist or is not a directory: {args.dir}")
 
@@ -8004,7 +8492,13 @@ def main():
     if args.url:
         host = urlparse(args.url).hostname or "target"
     else:
-        host = Path(args.dir).name or "local"
+        # Generic folder names ("output", "src", "dist") say nothing on their
+        # own — prefix the parent: jspect-myproject-dist-<ts>
+        d = Path(args.dir).resolve()
+        host = d.name or "local"
+        if host.lower() in _GENERIC_DIR_NAMES and d.parent.name:
+            host = f"{d.parent.name}-{host}"
+        host = re.sub(r"[^\w.-]+", "_", host)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(args.output) if args.output else Path(f"jspect-{host}-{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -8012,31 +8506,71 @@ def main():
     Log.verbose(f"absolute: {output_dir.resolve()}")
 
     results = {}
+    src_root = bundles_dir = None   # set in --dir mode
 
     # ── LOCAL DIRECTORY MODE ─────────────────────────────────────────────────
     # Skip Stages 1 & 2 (crawl + download). Use the supplied directory directly.
     if args.dir:
         stage_header("1-2", "Crawl + Download (skipped — local directory mode)")
-        Log.info(f"    [-] Using local source directory: {args.dir}")
-        js_clean = output_dir / "js-clean"
-        js_clean.mkdir(exist_ok=True)
-        # Symlink or copy every *.js file found under --dir into js-clean
-        src_root = Path(args.dir)
-        copied = 0
-        for jsfile in sorted(src_root.rglob("*.js")):
-            # Skip node_modules and hidden dirs
-            parts = jsfile.parts
-            if any(p.startswith(".") or p == "node_modules" for p in parts):
-                continue
-            # Flatten with a sanitised name so all files sit in js-clean/
-            rel = jsfile.relative_to(src_root)
-            flat_name = "__".join(rel.parts)  # e.g. app__routes__index.js
-            dest = js_clean / flat_name
-            if not dest.exists():
-                shutil.copy2(jsfile, dest)
-                copied += 1
-        Log.info(f"    {C.GREEN}[+]{C.RESET} Copied {copied} JS file(s) from {src_root}")
-        results["js_count"] = copied
+        src_root = Path(args.dir).resolve()
+        Log.info(f"    [-] Using local source directory: {src_root}")
+        js_clean = output_dir / "js-clean"       # mirror of the tree, real relative paths
+        bundles_dir = output_dir / "bundles"     # duplicate webpack bundles (secrets/CVE scan only)
+        excludes = list(args.exclude or [])
+        # Never re-ingest our own output when it lives inside the scanned tree
+        try:
+            excludes.append(output_dir.resolve().relative_to(src_root).as_posix())
+        except ValueError:
+            pass
+        local = collect_local_sources(
+            src_root, js_clean, bundles_dir,
+            node_modules=args.node_modules, excludes=excludes,
+            keep_bundles=args.keep_bundles,
+        )
+        results["local_collection"] = local
+
+        extra_str = ", ".join(f"{n} {ext}" for ext, n in
+                              sorted(local["extra_by_ext"].items(), key=lambda kv: -kv[1]))
+        Log.info(f"    {C.GREEN}[+]{C.RESET} Collected {local['js']} JS-like file(s)"
+                 + (f" + {local['extra']} config/data file(s) ({extra_str})" if local["extra"] else ""))
+        if local["first_party_pkgs"]:
+            label = "node_modules package(s) included" if args.node_modules == "all" \
+                else "unrecognised node_modules package(s) kept as first-party"
+            Log.info(f"    {C.GREEN}[+]{C.RESET} {len(local['first_party_pkgs'])} {label}: "
+                     f"{_short_list(local['first_party_pkgs'])}")
+        if local["bundles"]:
+            Log.info(f"    {C.DIM}↳ {len(local['bundles'])} webpack bundle(s) set aside as duplicates of the "
+                     f"recovered sources (still scanned by TruffleHog + Retire.js; --keep-bundles to analyse): "
+                     f"{_short_list(local['bundles'])}{C.RESET}")
+        skipped_parts = []
+        if local["public_pkgs"]:
+            if local["public_pkgs"] == ["node_modules/*"]:
+                skipped_parts.append("node_modules (--node-modules none)")
+            else:
+                skipped_parts.append(f"{len(local['public_pkgs'])} public npm package(s)")
+        sk = local["skipped"]
+        for key, label in (("excluded", "excluded"), ("hidden", "hidden"),
+                           ("declaration", ".d.ts"), ("empty", "empty"),
+                           ("large", f">{LOCAL_MAX_FILE_BYTES // (1024 * 1024)}MB")):
+            if sk[key]:
+                skipped_parts.append(f"{sk[key]} {label}")
+        if sk["other_ext"]:
+            top = sorted(local["other_exts"].items(), key=lambda kv: -kv[1])[:4]
+            skipped_parts.append(f"{sk['other_ext']} other type(s) ("
+                                 + ", ".join(f"{n} {e}" for e, n in top) + ")")
+        if skipped_parts:
+            Log.info(f"    [-] Skipped: {'; '.join(skipped_parts)}")
+        if local["public_pkgs"] and local["public_pkgs"] != ["node_modules/*"]:
+            Log.verbose(f"public packages skipped: {', '.join(local['public_pkgs'])}")
+            Log.info(f"    {C.DIM}↳ --node-modules all to include them, --exclude GLOB to drop more{C.RESET}")
+
+        lockfiles = [n for n in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml")
+                     if (src_root / n).exists()]
+        if lockfiles:
+            Log.info(f"    {C.DIM}↳ {lockfiles[0]} found — for dependency CVEs also run: "
+                     f"npm audit --package-lock-only (in {src_root}){C.RESET}")
+
+        results["js_count"] = local["js"]
         results["url_count"] = 0  # no crawl
 
         # Beautify still runs — source files may still benefit
@@ -8160,7 +8694,8 @@ def main():
     # ── end URL-mode block ───────────────────────────────────────────────────
 
     # Stage 4 — JSluice
-    endpoints, secrets = run_jsluice(analysis_target, output_dir)
+    endpoints, secrets = run_jsluice(analysis_target, output_dir,
+                                     extra_dirs=[bundles_dir] if bundles_dir else ())
     # Stage 1c may have already written endpoints.json from HTML hints. If
     # JSluice produced nothing (no JS or webpack-stripped), keep the hints file
     # so Stage 5 can still validate the URLs we found in HTML.
@@ -8201,7 +8736,8 @@ def main():
         results["live_count"] = count_nonempty_lines(live_file)
 
     # Stage 5b — Static metadata analysis (maps, JSON, comments)
-    meta = static_metadata_analysis(js_clean, output_dir, target_label, args.header)
+    meta = static_metadata_analysis(js_clean, output_dir, target_label, args.header,
+                                    local_json_root=js_clean if args.dir else None)
     results["exposed_maps_file"] = meta["maps_file"]
     results["json_exposures_file"] = meta["json_file"]
     results["swagger_endpoints_file"] = meta["swagger_endpoints_file"]
@@ -8264,26 +8800,33 @@ def main():
             pass
 
     # Stage 7 — Retire.js
-    retire_file = run_retire(analysis_target, output_dir)
+    if src_root:
+        # Scan the ORIGINAL tree: node_modules and bundles are exactly where
+        # vulnerable library versions live, even though we skip them elsewhere.
+        retire_ignore = []
+        try:
+            output_dir.resolve().relative_to(src_root)
+            retire_ignore.append(output_dir.resolve())
+        except ValueError:
+            pass
+        retire_file = run_retire(src_root, output_dir, fallback_dir=analysis_target,
+                                 ignore=retire_ignore)
+    else:
+        retire_file = run_retire(analysis_target, output_dir)
     results["retire_file"] = retire_file
     if retire_file:
         try:
             data = json.loads(retire_file.read_text(encoding="utf-8", errors="replace"))
             entries = data.get("data", []) if isinstance(data, dict) else data
-            vuln_count = 0
-            affected = set()
-            for entry in entries:
-                for r in entry.get("results", []):
-                    if r.get("vulnerabilities"):
-                        affected.add(f"{r.get('component')}@{r.get('version')}")
-                        vuln_count += len(r.get("vulnerabilities", []))
+            _, affected, unique_vulns = _retire_summary(entries)
             results["retire_vuln_libs"] = len(affected)
-            results["retire_vulns"] = vuln_count
+            results["retire_vulns"] = len(unique_vulns)
         except Exception:
             pass
 
     # Stage 8 — TruffleHog
-    th_file = run_trufflehog(analysis_target, output_dir, available, args.verify_secrets)
+    th_file = run_trufflehog(analysis_target, output_dir, available, args.verify_secrets,
+                             extra_paths=[bundles_dir] if bundles_dir else ())
     results["trufflehog_file"] = th_file
     results["th_verified"] = args.verify_secrets
     if th_file:
